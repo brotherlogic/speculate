@@ -83,6 +83,12 @@ flowchart LR
   * Create `k8s/deployment.yaml`, `k8s/service.yaml`, `k8s/cronjob-prober.yaml`, and `k8s/kustomization.yaml`.
   * Add `.github/workflows/docker-build.yml` for multi-architecture image builds on `ghcr.io/brotherlogic/speculate`.
   * Enhance `cmd/prober` to support environment variable configuration, Prometheus metrics export (`speculate_prober_runs_total`, `speculate_alignment_score`), and graceful scrape hold for Kubernetes CronJob execution.
+* [x] **Pre-Task 3.4: Project Initialization Command (`speculate init`)**
+  * Implement `speculate init` CLI command (`pkg/setup`) to initialize target repositories (like `speculate-kv`).
+  * Automate directory structure creation (`specs/`, `proto/`, `tests/`, `internal/`) with `.gitkeep`.
+  * Provision GitHub workflows (`review-gate.yml`, `auto-merge.yml`, `tests.yml`) and `.github/CODEOWNERS` with interactive conflict prompts.
+  * Automate GitHub repository settings (`allow_auto_merge`, `delete_branch_on_merge`), collaborator invite, and GitHub Ruleset configuration.
+  * Execute a single automated commit and push to remote.
 
 ### 🔍 Self-Reflection Pre-Task 3 Prober: Decoupled Prober & Containerization (PASSED)
 * **Target:** `go run cmd/prober/main.go --mode=evaluator --target-dir=/tmp/speculate-kv --metrics-addr=:8091`
