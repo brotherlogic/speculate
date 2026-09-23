@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: speculate-prober
+  namespace: speculate
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: speculate-prober
+        spec:
+          containers:
+            - name: speculate-prober
+              image: ghcr.io/brotherlogic/speculate:latest
+              command: ["./prober"]
+              args:
+                - "--mode=evaluator"
+                - "--target-repo=https://github.com/brotherlogic/speculate-kv"
+                - "--ollama-endpoint=http://192.168.68.112:11434/v1"
+                - "--metrics-addr=:8081"
+                - "--metrics-hold-timeout=30s"
+              ports:
+                - containerPort: 8081
+                  name: metrics
+              env:
+                - name: GH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: speculate-secret
+                      key: gh_token
+                      optional: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1024Mi
+          restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: speculate-prober
+  namespace: speculate
+  labels:
+    app: speculate-prober
+spec:
+  ports:
+    - name: metrics
+      port: 8081
+      targetPort: 8081
+  selector:
+    app: speculate-prober
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: speculate-prober
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+  namespaceSelector:
+    matchNames:
+      - speculate
+  selector:
+    matchLabels:
+      app: speculate-prober

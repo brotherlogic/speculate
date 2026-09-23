@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseSpecFile_ExampleKV(t *testing.T) {
-	specPath := filepath.Join("..", "..", "example", "specs", "kv.md")
+	specPath := filepath.Join("..", "..", "testdata", "specs", "kv.md")
 	spec, err := ParseSpecFile(specPath)
 	if err != nil {
 		t.Fatalf("ParseSpecFile(%q) failed: %v", specPath, err)

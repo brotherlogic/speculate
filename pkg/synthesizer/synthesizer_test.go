@@ -3,6 +3,7 @@ package synthesizer
 import (
 	"context"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,46 +77,14 @@ func TestGenerateScenarioCard_WithMockLLM(t *testing.T) {
 }
 
 func TestSynthesizeTest_WithMockLLM_ValidSyntax(t *testing.T) {
-	mockTestCode := `package tests
+	mockTestCode := `package sample_test
 
-import (
-	"context"
-	"net"
-	"testing"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/test/bufconn"
-
-	"github.com/brotherlogic/speculate/example/internal/server"
-	pb "github.com/brotherlogic/speculate/example/proto/kv/v1"
-)
+import "testing"
 
 // Stage: Core
 // Scenario: Core-1 Basic Put Overwrite
 func TestPut_Overwrite(t *testing.T) {
-	lis := bufconn.Listen(1024 * 1024)
-	s := grpc.NewServer()
-	pb.RegisterKVServer(s, server.New())
-	go s.Serve(lis)
-	t.Cleanup(func() { s.Stop() })
-
-	conn, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-	t.Cleanup(func() { conn.Close() })
-
-	client := pb.NewKVClient(conn)
-	_, err = client.Put(context.Background(), &pb.PutRequest{Key: "k", Value: []byte("v")})
-	if err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
+	t.Log("running synthesized test")
 }
 `
 
@@ -131,7 +100,7 @@ func TestPut_Overwrite(t *testing.T) {
 		TestFuncName: "TestPut_Overwrite",
 	}
 
-	code, err := syn.SynthesizeTest(context.Background(), card, "github.com/brotherlogic/speculate/example/internal/server", "github.com/brotherlogic/speculate/example/proto/kv/v1")
+	code, err := syn.SynthesizeTest(context.Background(), card, "github.com/brotherlogic/speculate-kv/internal/server", "github.com/brotherlogic/speculate-kv/proto/kv/v1")
 	if err != nil {
 		t.Fatalf("SynthesizeTest failed: %v", err)
 	}
@@ -151,53 +120,21 @@ func IncompleteFunc( {
 }
 
 func TestMutationProbe_FailsAgainstUnimplementedServer(t *testing.T) {
-	// A valid test asserting Put success against the current skeleton server
-	// must fail with codes.Unimplemented, proving the test is RED.
-	testCode := `package tests
+	// Verify that MutationProbe correctly captures test failure (RED state)
+	testCode := `package sample_test
 
-import (
-	"context"
-	"net"
-	"testing"
+import "testing"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/test/bufconn"
-
-	"github.com/brotherlogic/speculate/example/internal/server"
-	pb "github.com/brotherlogic/speculate/example/proto/kv/v1"
-)
-
-// Stage: Core
-// Scenario: Core-1 Basic Put Overwrite
-func TestPut_Probe(t *testing.T) {
-	lis := bufconn.Listen(1024 * 1024)
-	s := grpc.NewServer()
-	pb.RegisterKVServer(s, server.New())
-	go s.Serve(lis)
-	t.Cleanup(func() { s.Stop() })
-
-	conn, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	t.Cleanup(func() { conn.Close() })
-
-	client := pb.NewKVClient(conn)
-	_, err = client.Put(context.Background(), &pb.PutRequest{Key: "k", Value: []byte("v")})
-	if err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
+func TestUnimplemented_Red(t *testing.T) {
+	t.Fatalf("simulated error: method Put not implemented")
 }
 `
 
 	syn := NewSynthesizer(&evaluator.MockLLMClient{})
-	targetDir := filepath.Join("..", "..", "example", "tests")
+	targetDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(targetDir, "go.mod"), []byte("module sample\n\ngo 1.24\n"), 0644); err != nil {
+		t.Fatalf("failed to create dummy go.mod: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -208,11 +145,11 @@ func TestPut_Probe(t *testing.T) {
 	}
 
 	if !result.IsRed {
-		t.Errorf("expected probe to be RED (test failure against skeleton server), but passed! Output:\n%s", result.Output)
+		t.Errorf("expected probe to be RED (test failure), but passed! Output:\n%s", result.Output)
 	}
 
-	if !strings.Contains(result.Output, "method Put not implemented") && !strings.Contains(result.Output, "Unimplemented") {
-		t.Errorf("expected output to mention Unimplemented, got:\n%s", result.Output)
+	if !strings.Contains(result.Output, "method Put not implemented") {
+		t.Errorf("expected output to mention failure reason, got:\n%s", result.Output)
 	}
 }
 

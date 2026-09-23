@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: speculate
+  namespace: speculate
+  labels:
+    app: speculate
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: speculate
+  template:
+    metadata:
+      labels:
+        app: speculate
+    spec:
+      containers:
+        - name: speculate
+          image: ghcr.io/brotherlogic/speculate:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 50051
+              name: grpc
+          env:
+            - name: HTTP_PORT
+              value: "8080"
+            - name: GRPC_PORT
+              value: "50051"
+            - name: OLLAMA_ENDPOINT
+              value: "http://192.168.68.112:11434/v1"
+            - name: TARGET_REPO
+              value: "brotherlogic/speculate-kv"
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: speculate-secret
+                  key: gh_token
+                  optional: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            grpc:
+              port: 50051
+              service: speculate
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

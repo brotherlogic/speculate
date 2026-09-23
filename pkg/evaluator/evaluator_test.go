@@ -11,7 +11,7 @@ import (
 )
 
 func TestEvaluate_EmptyTestSuite_ZeroPercent(t *testing.T) {
-	specPath := filepath.Join("..", "..", "example", "specs", "kv.md")
+	specPath := filepath.Join("..", "..", "testdata", "specs", "kv.md")
 	spec, err := parser.ParseSpecFile(specPath)
 	if err != nil {
 		t.Fatalf("ParseSpecFile failed: %v", err)
@@ -19,7 +19,7 @@ func TestEvaluate_EmptyTestSuite_ZeroPercent(t *testing.T) {
 
 	eval := NewEvaluator(&MockLLMClient{})
 	emptySuite := &parser.TestSuite{
-		Directory: "example/tests",
+		Directory: t.TempDir(),
 		Scenarios: []*parser.TestScenario{},
 	}
 
