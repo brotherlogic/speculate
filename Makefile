@@ -3,7 +3,7 @@
 all: test build
 
 proto:
-	@protos=$$(find proto example/proto -name "*.proto" 2>/dev/null); \
+	@protos=$$(find proto -name "*.proto" 2>/dev/null); \
 	if [ -n "$$protos" ]; then \
 		for f in $$protos; do \
 			echo "Compiling $$f..."; \

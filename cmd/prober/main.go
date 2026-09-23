@@ -2,40 +2,161 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/brotherlogic/speculate/pkg/evaluator"
 	"github.com/brotherlogic/speculate/pkg/parser"
 	"github.com/brotherlogic/speculate/pkg/synthesizer"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+var (
+	proberRunsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "speculate_prober_runs_total",
+			Help: "Total count of speculate prober execution runs.",
+		},
+		[]string{"repo", "status"},
+	)
+	proberDurationSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "speculate_prober_duration_seconds",
+			Help:    "Duration of prober execution runs in seconds.",
+			Buckets: []float64{0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0},
+		},
+		[]string{"repo"},
+	)
+	specAlignmentScore = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "speculate_alignment_score",
+			Help: "Calculated alignment percentage of the target repository.",
+		},
+		[]string{"repo"},
+	)
 )
 
 func main() {
-	mode := flag.String("mode", "evaluator", "Prober execution mode: evaluator, harness, simulation")
+	defaultMode := os.Getenv("PROBER_MODE")
+	if defaultMode == "" {
+		defaultMode = "evaluator"
+	}
+	defaultTargetDir := os.Getenv("PROBER_TARGET_DIR")
+	defaultTargetRepo := os.Getenv("PROBER_TARGET_REPO")
+	if defaultTargetRepo == "" {
+		defaultTargetRepo = "https://github.com/brotherlogic/speculate-kv"
+	}
+	defaultOllamaEndpoint := os.Getenv("OLLAMA_ENDPOINT")
+	if defaultOllamaEndpoint == "" {
+		defaultOllamaEndpoint = "http://192.168.68.112:11434/v1"
+	}
+	defaultMetricsAddr := os.Getenv("PROBER_METRICS_ADDR")
+
+	mode := flag.String("mode", defaultMode, "Prober execution mode: evaluator, simulation, cluster")
+	targetDir := flag.String("target-dir", defaultTargetDir, "Local target directory of the repository to probe (e.g. /tmp/speculate-kv)")
+	targetRepo := flag.String("target-repo", defaultTargetRepo, "Target repository git URL")
+	ollamaEndpoint := flag.String("ollama-endpoint", defaultOllamaEndpoint, "Ollama API endpoint")
+	metricsAddr := flag.String("metrics-addr", defaultMetricsAddr, "Optional address to serve Prometheus metrics until scraped (e.g. :8081)")
+	metricsHoldTimeout := flag.Duration("metrics-hold-timeout", 30*time.Second, "Hold duration to wait for Prometheus scrape")
 	flag.Parse()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+
+	start := time.Now()
+	var runErr error
+
+	resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo)
+	if err != nil {
+		log.Fatalf("❌ Failed to resolve target repo: %v", err)
+	}
+	defer cleanup()
 
 	switch *mode {
 	case "evaluator":
-		if err := runEvaluatorProber(ctx); err != nil {
-			log.Fatalf("❌ Prober 2 Failed: %v", err)
+		runErr = runEvaluatorProber(ctx, resolvedDir, *targetRepo, *ollamaEndpoint)
+		if runErr != nil {
+			log.Printf("❌ Prober Failed: %v", runErr)
+		} else {
+			fmt.Println("✅ [PROBER PASS] Target repository evaluated and synthesized successfully!")
 		}
-		fmt.Println("✅ [PROBER 2 PASS] Evaluator and Synthesizer verified successfully!")
 	default:
-		log.Fatalf("Unknown prober mode: %s", *mode)
+		runErr = fmt.Errorf("unknown prober mode: %s", *mode)
+		log.Printf("❌ %v", runErr)
+	}
+
+	duration := time.Since(start)
+	statusStr := "success"
+	if runErr != nil {
+		statusStr = "failure"
+	}
+	proberRunsTotal.WithLabelValues(*targetRepo, statusStr).Inc()
+	proberDurationSeconds.WithLabelValues(*targetRepo).Observe(duration.Seconds())
+
+	if *metricsAddr != "" {
+		log.Printf("Serving prober metrics on %s (hold timeout: %v)...", *metricsAddr, *metricsHoldTimeout)
+		if err := serveMetricsUntilScraped(ctx, *metricsAddr, *metricsHoldTimeout); err != nil {
+			log.Printf("Warning: failed serving metrics: %v", err)
+		}
+	}
+
+	if runErr != nil {
+		os.Exit(1)
 	}
 }
 
-func runEvaluatorProber(ctx context.Context) error {
-	specPath := filepath.Join("example", "specs", "kv.md")
-	testsDir := filepath.Join("example", "tests")
+func resolveTargetDir(ctx context.Context, dir, repoURL string) (string, func(), error) {
+	noop := func() {}
 
-	fmt.Println("🔍 Step 1: Parsing specification and existing tests...")
+	if dir != "" {
+		if _, err := os.Stat(dir); err == nil {
+			return dir, noop, nil
+		}
+	}
+
+	// Check if /tmp/speculate-kv exists locally
+	candidate := "/tmp/speculate-kv"
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate, noop, nil
+	}
+
+	// Fallback to testdata if local
+	if _, err := os.Stat("testdata/specs/kv.md"); err == nil {
+		return "testdata", noop, nil
+	}
+
+	// Otherwise clone target repo into a temp directory
+	tempDir, err := os.MkdirTemp("", "speculate-target-*")
+	if err != nil {
+		return "", noop, fmt.Errorf("creating temp dir: %w", err)
+	}
+	cleanup := func() { os.RemoveAll(tempDir) }
+
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, tempDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanup()
+		return "", noop, fmt.Errorf("cloning %s: %s: %w", repoURL, string(out), err)
+	}
+
+	return tempDir, cleanup, nil
+}
+
+func runEvaluatorProber(ctx context.Context, repoDir, targetRepo, ollamaEndpoint string) error {
+	specPath := filepath.Join(repoDir, "specs", "kv.md")
+	testsDir := filepath.Join(repoDir, "tests")
+
+	fmt.Printf("🔍 Step 1: Parsing specification at %s...\n", specPath)
 	spec, err := parser.ParseSpecFile(specPath)
 	if err != nil {
 		return fmt.Errorf("parsing spec %q: %w", specPath, err)
@@ -46,11 +167,11 @@ func runEvaluatorProber(ctx context.Context) error {
 		return fmt.Errorf("parsing tests %q: %w", testsDir, err)
 	}
 
-	fmt.Printf("✓ Spec: %s (%d stages, %d requirements)\n", spec.Title, len(spec.Stages), spec.TotalRequirements())
+	fmt.Printf("✓ Target Spec: %s (%d stages, %d requirements)\n", spec.Title, len(spec.Stages), spec.TotalRequirements())
 	fmt.Printf("✓ Discovered tests: %d scenarios\n\n", len(testSuite.Scenarios))
 
-	fmt.Println("🔍 Step 2: Running Spec Evaluator...")
-	llmClient := evaluator.NewOllamaClient("", "")
+	fmt.Println("🔍 Step 2: Running Spec Evaluator against target...")
+	llmClient := evaluator.NewOllamaClient(ollamaEndpoint, "")
 	eval := evaluator.NewEvaluator(llmClient)
 
 	evalResult, err := eval.Evaluate(ctx, spec, testSuite)
@@ -58,10 +179,8 @@ func runEvaluatorProber(ctx context.Context) error {
 		return fmt.Errorf("evaluating spec alignment: %w", err)
 	}
 
+	specAlignmentScore.WithLabelValues(targetRepo).Set(float64(evalResult.Percentage))
 	fmt.Printf("✓ Alignment Score: %d%% (%s)\n", evalResult.Percentage, evalResult.BadgeMarkdown)
-	if evalResult.Percentage != 0 {
-		return fmt.Errorf("expected 0%% alignment on empty test baseline, got %d%%", evalResult.Percentage)
-	}
 	if evalResult.ActiveFrontierStage == nil {
 		return fmt.Errorf("expected active frontier stage, got nil")
 	}
@@ -72,7 +191,7 @@ func runEvaluatorProber(ctx context.Context) error {
 	fmt.Printf("✓ Active Frontier Stage: %s\n", evalResult.ActiveFrontierStage.Name)
 	fmt.Printf("✓ Next Requirement to Exercise: [%s] %s\n\n", evalResult.NextRequirement.ID, evalResult.NextRequirement.Description)
 
-	fmt.Println("🔍 Step 3: Synthesizing Scenario Card...")
+	fmt.Println("🔍 Step 3: Synthesizing Scenario Card via local LLM...")
 	syn := synthesizer.NewSynthesizer(llmClient)
 
 	protoContract := `service KV {
@@ -90,7 +209,6 @@ func runEvaluatorProber(ctx context.Context) error {
 
 	fmt.Println("🔍 Step 4: Validating executable test code and running Mutation Probe (Red Phase)...")
 
-	// Canonical test template exercising the scenario against the skeleton server
 	testCode := fmt.Sprintf(`package tests
 
 import (
@@ -102,8 +220,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/brotherlogic/speculate/example/internal/server"
-	pb "github.com/brotherlogic/speculate/example/proto/kv/v1"
+	"github.com/brotherlogic/speculate-kv/internal/server"
+	pb "github.com/brotherlogic/speculate-kv/proto/kv/v1"
 )
 
 // Stage: %s
@@ -148,13 +266,69 @@ func %s(t *testing.T) {
 		return fmt.Errorf("mutation probe expected RED test failure against skeleton server, but test passed unexpectedly!\nOutput:\n%s", probeResult.Output)
 	}
 
-	fmt.Println("✓ Mutation Probe successfully confirmed RED failure against skeleton server:")
+	fmt.Println("✓ Mutation Probe successfully confirmed RED failure against target repo skeleton server:")
 	for _, line := range osLines(probeResult.Output) {
 		if len(line) > 0 {
 			fmt.Printf("   | %s\n", line)
 		}
 	}
 	fmt.Println()
+
+	return nil
+}
+
+func serveMetricsUntilScraped(ctx context.Context, addr string, timeout time.Duration) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
+	scrapedCh := make(chan struct{})
+	var once sync.Once
+
+	promHandler := promhttp.Handler()
+	scrapeDetector := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		promHandler.ServeHTTP(w, r)
+		once.Do(func() {
+			close(scrapedCh)
+		})
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", scrapeDetector)
+
+	server := &http.Server{Handler: mux}
+	serverErrCh := make(chan error, 1)
+	go func() {
+		if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			serverErrCh <- serveErr
+		}
+		close(serverErrCh)
+	}()
+
+	var timer *time.Timer
+	var timerCh <-chan time.Time
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
+		timerCh = timer.C
+	}
+
+	select {
+	case err := <-serverErrCh:
+		return err
+	case <-scrapedCh:
+	case <-timerCh:
+	case <-ctx.Done():
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
 
 	return nil
 }

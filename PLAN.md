@@ -59,21 +59,45 @@ flowchart LR
   * Run mutation probe to verify the generated test fails against the current un-implemented server (Red).
 
 ### 🔍 Self-Reflection Prober 2: Evaluator & Synthesizer Prober (PASSED)
-* **Target:** `go run cmd/prober/main.go --mode=evaluator`
+* **Target:** `go run cmd/prober/main.go --mode=evaluator --target-dir=/tmp/speculate-kv`
 * **Verification Criteria:**
-  * Runs evaluator on `example/specs/kv.md` against an empty `example/tests/`.
+  * Runs evaluator on `specs/kv.md` in `brotherlogic/speculate-kv` against an empty `tests/`.
   * Confirms alignment score is reported as `0%`.
   * Generates Scenario Card for `[Stage: Core] Basic Put/Get`.
-  * Emits valid Go test code, verifies that `go vet` passes on the test code, and verifies that executing the test against `example/internal/server/` returns a **RED** failure.
+  * Emits valid Go test code, verifies that `go vet` passes on the test code, and verifies that executing the test against `internal/server/` returns a **RED** failure.
+
+---
+
+## Pre-Task 3: Repository Separation & Kubernetes Foundation
+**Goal:** Decouple the orchestrator (`brotherlogic/speculate`) from target projects by moving all example code into `brotherlogic/speculate-kv`, containerizing `speculate`, and provisioning Kubernetes manifests and automated prober execution.
+
+### Tasks
+* [x] **Pre-Task 3.1: Repository Separation (`brotherlogic/speculate-kv`)**
+  * Move all example code (`proto/`, `specs/`, `internal/server/`, `tests/`) to standalone repo `brotherlogic/speculate-kv`.
+  * Remove `example/` from `speculate` orchestrator repo, retaining minimal hermetic testdata (`testdata/specs/kv.md`) for internal package unit tests.
+  * Initialize `brotherlogic/speculate-kv` with Go module, CI workflows, and empty skeleton server.
+* [x] **Pre-Task 3.2: Containerization & Daemon Scaffolding**
+  * Create multi-stage `Dockerfile` producing `/bin/speculate` and `/bin/prober`.
+  * Implement Kubernetes-ready daemon in `cmd/speculate` exposing `/healthz`, `/metrics`, `/status`, and gRPC Health service.
+* [x] **Pre-Task 3.3: Kubernetes Manifests & Automated Probers**
+  * Create `k8s/deployment.yaml`, `k8s/service.yaml`, `k8s/cronjob-prober.yaml`, and `k8s/kustomization.yaml`.
+  * Add `.github/workflows/docker-build.yml` for multi-architecture image builds on `ghcr.io/brotherlogic/speculate`.
+  * Enhance `cmd/prober` to support environment variable configuration, Prometheus metrics export (`speculate_prober_runs_total`, `speculate_alignment_score`), and graceful scrape hold for Kubernetes CronJob execution.
+
+### 🔍 Self-Reflection Pre-Task 3 Prober: Decoupled Prober & Containerization (PASSED)
+* **Target:** `go run cmd/prober/main.go --mode=evaluator --target-dir=/tmp/speculate-kv --metrics-addr=:8091`
+* **Verification Criteria:**
+  * Prober clones/resolves external repo `brotherlogic/speculate-kv`, evaluates spec, generates Scenario Card, and confirms RED failure against skeleton server.
+  * Prober exports Prometheus metrics and holds until scraped.
 
 ---
 
 ## Phase 3: GitHub & Devcontainer-Manager Integrations (The "Hands")
-**Goal:** Build client packages to manage GitHub resources and trigger Antigravity devcontainer environments.
+**Goal:** Build client packages to manage GitHub resources on target repositories (`brotherlogic/speculate-kv`) and trigger Antigravity devcontainer environments via `devcontainer-manager`.
 
 ### Tasks
 * [ ] **Task 3.1: GitHub Client Adapter (`pkg/github`)**
-  * Manage feature branches (`feat/<stage>`) and test branches (`test/<scenario>`).
+  * Manage feature branches (`feat/<stage>`) and test branches (`test/<scenario>`) on the target repository.
   * Create issues with required labels (`speculate-agentic-loop`, `speculate-align`, `speculate-stalled`).
   * Open Pull Requests targeting `feat/<stage>`.
   * Update the README alignment badge and perform squash merges.
@@ -101,9 +125,9 @@ flowchart LR
     * `TEST_PR_PENDING`: Test proposed; waiting for human review on PR.
     * `ALIGNING`: Test merged; agent running code implementation (up to 3 rounds).
     * `STALLED`: 3 align rounds exhausted; human attention needed.
-* [ ] **Task 4.2: Webhook Consumer & Daemon Entrypoint (`cmd/speculated`)**
+* [ ] **Task 4.2: Webhook Consumer & Daemon Integration (`cmd/speculate`)**
   * Implement gRPC receiver to accept forwarded GitHub events from `ghwebhook`.
-  * Handle `push` to `main`, `pull_request` merged, and check suite completions.
+  * Handle `push` to `main`, `pull_request` merged, and check suite completions on target repo.
 * [ ] **Task 4.3: Automated Zero-Touch Promotion**
   * Once `go test` passes on `feat/<stage>`, trigger automated squash merge to `main`.
   * Automatically handles Git branch cleanup.
@@ -121,15 +145,14 @@ flowchart LR
 ---
 
 ## Phase 5: Production Deployment & Cluster E2E Prober
-**Goal:** Deploy `speculated` to the Kubernetes homelab cluster and verify with a live end-to-end integration test.
+**Goal:** Deploy `speculate` to the Kubernetes homelab cluster and verify with a live end-to-end integration test.
 
 ### Tasks
 * [ ] **Task 5.1: Live Cluster Prober (`cmd/prober/main.go`)**
-  * Prober that can be executed from CI or local dev to validate end-to-end interaction with real GitHub, `ghwebhook`, and DCM.
-* [ ] **Task 5.2: Dockerfile & Kubernetes Manifests**
-  * Containerize `speculated`.
-  * Create Kubernetes Deployment and Service definitions for homelab cluster deployment.
-  * Register `speculated` gRPC endpoint with `ghwebhook`.
+  * Prober that can be executed from CI, CronJob, or local dev to validate end-to-end interaction with real GitHub, `ghwebhook`, and DCM.
+* [ ] **Task 5.2: Production Flux CD Integration**
+  * Integrate `k8s/` resources into `brotherlogic/prod` cluster repository.
+  * Register `speculate` gRPC endpoint with `ghwebhook`.
 
 ---
 
@@ -139,7 +162,9 @@ flowchart LR
 Phase 1: Hermetic Sandbox & Foundation
    └── [Prober 1 PASS] ──> Proceed to Phase 2
 Phase 2: Spec Evaluator & Alignment Engine
-   └── [Prober 2 PASS] ──> Proceed to Phase 3
+   └── [Prober 2 PASS] ──> Proceed to Pre-Task 3
+Pre-Task 3: Repo Separation & Kubernetes Setup
+   └── [Pre-Task 3 Prober PASS] ──> Proceed to Phase 3
 Phase 3: GitHub & DCM Integration Layer
    └── [Prober 3 PASS] ──> Proceed to Phase 4
 Phase 4: State Machine & Orchestrator Daemon

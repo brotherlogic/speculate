@@ -7,11 +7,10 @@ import (
 )
 
 func TestParseTestDir_EmptyDirectory(t *testing.T) {
-	// example/tests currently has 0 test files (only .gitkeep)
-	exampleTestsDir := filepath.Join("..", "..", "example", "tests")
-	suite, err := ParseTestDir(exampleTestsDir)
+	emptyDir := t.TempDir()
+	suite, err := ParseTestDir(emptyDir)
 	if err != nil {
-		t.Fatalf("ParseTestDir(%q) failed: %v", exampleTestsDir, err)
+		t.Fatalf("ParseTestDir(%q) failed: %v", emptyDir, err)
 	}
 
 	if len(suite.Files) != 0 {
