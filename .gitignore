@@ -1,3 +1,5 @@
 *~
 *.env*
 .devcontainer/.env.auth
+/speculate
+/bin/

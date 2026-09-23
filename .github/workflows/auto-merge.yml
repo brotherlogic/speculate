@@ -1,0 +1,35 @@
+name: Auto-merge PR
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+  status:
+  check_suite:
+    types:
+      - completed
+
+jobs:
+  enable-auto-merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            PR_URL="${{ github.event.pull_request.html_url }}"
+          else
+            PR_URL=$(gh pr list --head "${{ github.sha }}" --json url --jq '.[0].url')
+          fi
+          
+          if [ -n "$PR_URL" ]; then
+            gh pr merge --auto --squash "$PR_URL"
+          else
+            echo "No associated PR found for this event."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.GITHUB_TOKEN }}

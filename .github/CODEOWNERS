@@ -1,0 +1,9 @@
+# Reviews required by @brotherlogic on contracts, specs, and test files
+*.proto @brotherlogic
+*_test.go @brotherlogic
+proto/** @brotherlogic
+specs/** @brotherlogic
+tests/** @brotherlogic
+example/proto/** @brotherlogic
+example/specs/** @brotherlogic
+example/tests/** @brotherlogic
