@@ -48,8 +48,8 @@ flowchart LR
 * [x] **Task 2.1: Spec & Test Parser (`pkg/parser`)**
   * Parse staged Markdown specifications into structured Stage and Requirement ASTs.
   * Inspect existing test files in `tests/` to extract covered scenarios and assertion targets.
-* [ ] **Task 2.2: LLM Spec Evaluator (`pkg/evaluator`)**
-  * Interface with the LLM API (via Gemini / Claude / local model config).
+* [x] **Task 2.2: LLM Spec Evaluator (`pkg/evaluator`)**
+  * Interface with local Ollama LLM endpoint (`deepseek-coder-v2:latest`).
   * Evaluate spec coverage fraction: `Passing Covered Scenarios / Total Spec Scenarios`.
   * Format the coverage badge string for `README.md`.
 * [ ] **Task 2.3: Scenario Card & Test Synthesizer (`pkg/synthesizer`)**
