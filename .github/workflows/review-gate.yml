@@ -58,6 +58,12 @@ jobs:
             exit 0
           fi
 
+          PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author --jq '.author.login')
+          if [ "$PR_AUTHOR" = "brotherlogic" ]; then
+            echo "✓ PR #${PR_NUMBER} is authored by @brotherlogic. Human review requirement satisfied by author."
+            exit 0
+          fi
+
           echo "Protected files modified. Ensuring @brotherlogic is requested for review..."
           REVIEWER_REQUESTED=$(gh pr view "$PR_NUMBER" --json reviewRequests --jq '[.reviewRequests[] | select(.login == "brotherlogic" or .name == "brotherlogic")] | length')
           if [ "$REVIEWER_REQUESTED" -eq 0 ]; then
