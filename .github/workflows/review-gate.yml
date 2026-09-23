@@ -21,6 +21,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,7 +30,7 @@ jobs:
 
       - name: Check review requirements
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ github.event.pull_request.number }}"
           if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
@@ -77,6 +78,15 @@ jobs:
 
           if [ "$APPROVALS" -gt 0 ]; then
             echo "✓ PR #${PR_NUMBER} has been approved by @brotherlogic."
+            if [ "${{ github.event_name }}" = "pull_request_review" ]; then
+              HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+              echo "Review approved on pull_request_review event. Checking for previous failed pull_request runs on ${HEAD_SHA}..."
+              FAILED_RUNS=$(gh run list --workflow=review-gate.yml --event=pull_request --commit="$HEAD_SHA" --status=failure --json databaseId --jq '.[].databaseId')
+              for run_id in $FAILED_RUNS; do
+                echo "Triggering rerun of failed pull_request run $run_id..."
+                gh run rerun "$run_id" || true
+              done
+            fi
             exit 0
           else
             echo "::error::PR #${PR_NUMBER} modifies protected contracts/specs/tests and requires an approving review from @brotherlogic."
