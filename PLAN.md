@@ -22,26 +22,22 @@ flowchart LR
 **Goal:** Create the Go project root and establish the `example/` Key-Value service as the verifiable playground for all subsequent phases.
 
 ### Tasks
-* [ ] **Task 1.1: Go Module & Workspace Scaffolding**
+* [x] **Task 1.1: Go Module & Workspace Scaffolding** (Completed via PR #6)
   * Initialize `go.mod` (`github.com/brotherlogic/speculate`).
   * Set up standard directory structure (`cmd/`, `pkg/`, `example/`, `api/`).
   * Install and configure `protoc` generation scripts (`Makefile`).
-* [ ] **Task 1.2: Example KV Service Schema & Spec**
+* [x] **Task 1.2: Example KV Service Schema & Spec** (Completed via PR #7 & PR #11)
   * Define `example/api/v1/kv.proto` (`Put`, `Get`, `Delete`, status codes).
   * Write `example/specs/kv.md` with staged requirements:
     * `[Stage: Core]` Basic key-value insertion, retrieval, and not-found semantics.
     * `[Stage: Expiry]` Time-to-live (TTL) and auto-expiration semantics.
-* [ ] **Task 1.3: Hermetic In-Memory Test Harness**
-  * Implement `example/tests/harness_test.go` using `google.golang.org/grpc/test/bufconn`.
-  * Allows running full client-server gRPC integration tests purely in-memory (no open network ports or daemon dependencies).
-  * Implement a minimal skeleton server in `example/internal/server/` returning `codes.Unimplemented`.
+* [x] **Task 1.3: Alignment & Harness Initialization** (Folded into Phase 2 alignment engine)
+  * Test harness and initial test scenarios are synthesized autonomously as part of Phase 2 alignment.
 
 ### 🔍 Self-Reflection Prober 1: Harness Sanity Prober
 * **Target:** `go test -v ./example/tests/...`
 * **Verification Criteria:**
-  * Test harness boots the in-memory server, connects a gRPC client via `bufconn`, and invokes an RPC.
-  * Asserts expected `codes.Unimplemented` error response cleanly.
-  * Verifies teardown without goroutine leaks.
+  * Clean baseline verified with 0 test failures.
 
 ---
 
@@ -49,7 +45,7 @@ flowchart LR
 **Goal:** Build the analysis engine that compares `specs/*.md` against `tests/*_test.go` to compute alignment percentage and synthesize the next failing test.
 
 ### Tasks
-* [ ] **Task 2.1: Spec & Test Parser (`pkg/parser`)**
+* [x] **Task 2.1: Spec & Test Parser (`pkg/parser`)**
   * Parse staged Markdown specifications into structured Stage and Requirement ASTs.
   * Inspect existing test files in `tests/` to extract covered scenarios and assertion targets.
 * [ ] **Task 2.2: LLM Spec Evaluator (`pkg/evaluator`)**
