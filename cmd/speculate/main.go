@@ -14,20 +14,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/brotherlogic/speculate/pkg/setup"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
-type Config struct {
+type DaemonConfig struct {
 	HTTPPort       int
 	GRPCPort       int
 	OllamaEndpoint string
 	TargetRepo     string
 }
 
-func parseConfig() *Config {
+func parseDaemonConfig(args []string) *DaemonConfig {
 	httpPort := 8080
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
@@ -56,13 +57,14 @@ func parseConfig() *Config {
 		targetRepo = "brotherlogic/speculate-kv"
 	}
 
-	flag.IntVar(&httpPort, "http-port", httpPort, "HTTP server port")
-	flag.IntVar(&grpcPort, "grpc-port", grpcPort, "gRPC server port")
-	flag.StringVar(&ollamaEndpoint, "ollama-endpoint", ollamaEndpoint, "Ollama LLM API endpoint")
-	flag.StringVar(&targetRepo, "target-repo", targetRepo, "Target repository (owner/repo)")
-	flag.Parse()
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	fs.IntVar(&httpPort, "http-port", httpPort, "HTTP server port")
+	fs.IntVar(&grpcPort, "grpc-port", grpcPort, "gRPC server port")
+	fs.StringVar(&ollamaEndpoint, "ollama-endpoint", ollamaEndpoint, "Ollama LLM API endpoint")
+	fs.StringVar(&targetRepo, "target-repo", targetRepo, "Target repository (owner/repo)")
+	_ = fs.Parse(args)
 
-	return &Config{
+	return &DaemonConfig{
 		HTTPPort:       httpPort,
 		GRPCPort:       grpcPort,
 		OllamaEndpoint: ollamaEndpoint,
@@ -70,8 +72,8 @@ func parseConfig() *Config {
 	}
 }
 
-func main() {
-	cfg := parseConfig()
+func runDaemon(args []string) {
+	cfg := parseDaemonConfig(args)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -136,4 +138,55 @@ func main() {
 	grpcServer.GracefulStop()
 	_ = httpServer.Shutdown(shutdownCtx)
 	log.Println("Speculate daemon stopped.")
+}
+
+func runInit(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	repo := fs.String("repo", "", "Target GitHub repository (owner/name); inferred from git remote if empty")
+	token := fs.String("token", "", "GitHub personal access token (defaults to GH_TOKEN / GITHUB_TOKEN)")
+	collaborator := fs.String("collaborator", "brotherlogic-automation", "Automation collaborator to add")
+	dir := fs.String("dir", ".", "Target project directory")
+	force := fs.Bool("force", false, "Overwrite existing files without prompting")
+	skipPush := fs.Bool("skip-push", false, "Skip git commit and push")
+
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("failed parsing flags: %v", err)
+	}
+
+	cfg := &setup.Config{
+		RootDir:      *dir,
+		Repo:         *repo,
+		Token:        *token,
+		Collaborator: *collaborator,
+		Force:        *force,
+		SkipPush:     *skipPush,
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := setup.Run(ctx, cfg); err != nil {
+		log.Fatalf("❌ speculate init failed: %v", err)
+	}
+}
+
+func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "init":
+			runInit(os.Args[2:])
+			return
+		case "daemon":
+			runDaemon(os.Args[2:])
+			return
+		case "help", "-h", "--help":
+			fmt.Println("Usage: speculate <command> [options]")
+			fmt.Println("Commands:")
+			fmt.Println("  init    Initialize a target repository with speculate structure, workflows, and rulesets")
+			fmt.Println("  daemon  Run the speculate orchestrator daemon (default)")
+			return
+		}
+	}
+
+	runDaemon(os.Args[1:])
 }
