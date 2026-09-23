@@ -27,11 +27,16 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// KV provides basic key-value storage operations.
+// Review Policy:
+// This interface defines the core contract for the example Key-Value store.
+// Any changes to RPC signatures, request/response messages, or error domains
+// require explicit human review and approval by @brotherlogic before merge.
 type KVClient interface {
 	// Put associates a byte payload with the given key.
+	// Overwrites existing data if key already exists.
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
-	// Get retrieves the byte payload for the given key, or returns NOT_FOUND.
+	// Get retrieves the byte payload for the given key.
+	// Returns codes.NotFound (NOT_FOUND) if the key does not exist.
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 }
 
@@ -67,11 +72,16 @@ func (c *kVClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOpt
 // All implementations must embed UnimplementedKVServer
 // for forward compatibility.
 //
-// KV provides basic key-value storage operations.
+// Review Policy:
+// This interface defines the core contract for the example Key-Value store.
+// Any changes to RPC signatures, request/response messages, or error domains
+// require explicit human review and approval by @brotherlogic before merge.
 type KVServer interface {
 	// Put associates a byte payload with the given key.
+	// Overwrites existing data if key already exists.
 	Put(context.Context, *PutRequest) (*PutResponse, error)
-	// Get retrieves the byte payload for the given key, or returns NOT_FOUND.
+	// Get retrieves the byte payload for the given key.
+	// Returns codes.NotFound (NOT_FOUND) if the key does not exist.
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	mustEmbedUnimplementedKVServer()
 }
