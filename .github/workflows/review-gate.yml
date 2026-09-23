@@ -1,0 +1,71 @@
+name: Review Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
+
+jobs:
+  review-gate:
+    name: review-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check review requirements
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "No PR number found, skipping check."
+            exit 0
+          fi
+
+          echo "Inspecting files changed in PR #${PR_NUMBER}..."
+          CHANGED_FILES=$(gh pr diff "$PR_NUMBER" --name-only)
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          PROTECTED=false
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              *.proto|*_test.go|specs/*|*/specs/*|tests/*|*/tests/*|proto/*|*/proto/*|api/*|*/api/*)
+                echo "Protected path matched: $file"
+                PROTECTED=true
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          if [ "$PROTECTED" = "false" ]; then
+            echo "✓ No protected files modified. Human review not required."
+            exit 0
+          fi
+
+          echo "Protected files modified. Checking for approval from @brotherlogic..."
+          APPROVALS=$(gh pr view "$PR_NUMBER" --json reviews --jq '[.reviews[] | select(.author.login == "brotherlogic" and .state == "APPROVED")] | length')
+          echo "Found $APPROVALS approval(s) from @brotherlogic"
+
+          if [ "$APPROVALS" -gt 0 ]; then
+            echo "✓ PR #${PR_NUMBER} has been approved by @brotherlogic."
+            exit 0
+          else
+            echo "::error::PR #${PR_NUMBER} modifies protected contracts/specs/tests and requires an approving review from @brotherlogic."
+            exit 1
+          fi
