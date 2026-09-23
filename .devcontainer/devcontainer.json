@@ -22,7 +22,7 @@
 	"postCreateCommand": "./postCreate.sh",
 	"workspaceFolder": "/workspaces/speculate",
 	"workingDir": "/workspaces/speculate",
-	"initializeCommand": "echo \"GH_TOKEN=$(gh auth token)\" > .devcontainer/.env.auth",
+"initializeCommand": "cat ~/.seraphine-automation > .devcontainer/.env.auth",
 	"runArgs": [
 		"--security-opt",
 	    "label=disable",
