@@ -28,15 +28,29 @@ var (
 			Name: "speculate_prober_runs_total",
 			Help: "Total count of speculate prober execution runs.",
 		},
-		[]string{"repo", "status"},
+		[]string{"repo", "prober", "status"},
 	)
 	proberDurationSeconds = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "speculate_prober_duration_seconds",
 			Help:    "Duration of prober execution runs in seconds.",
-			Buckets: []float64{0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0},
+			Buckets: []float64{0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0},
 		},
-		[]string{"repo"},
+		[]string{"repo", "prober"},
+	)
+	proberLastDurationSeconds = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "speculate_prober_last_duration_seconds",
+			Help: "Duration of the most recent prober execution run in seconds.",
+		},
+		[]string{"repo", "prober"},
+	)
+	proberStatus = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "speculate_prober_status",
+			Help: "Status code of the prober run (1 = success, 0 = failure).",
+		},
+		[]string{"repo", "prober"},
 	)
 	specAlignmentScore = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -97,12 +111,7 @@ func main() {
 	}
 
 	duration := time.Since(start)
-	statusStr := "success"
-	if runErr != nil {
-		statusStr = "failure"
-	}
-	proberRunsTotal.WithLabelValues(*targetRepo, statusStr).Inc()
-	proberDurationSeconds.WithLabelValues(*targetRepo).Observe(duration.Seconds())
+	recordProberResult(*targetRepo, *mode, duration, runErr)
 
 	if *metricsAddr != "" {
 		log.Printf("Serving prober metrics on %s (hold timeout: %v)...", *metricsAddr, *metricsHoldTimeout)
@@ -179,7 +188,7 @@ func runEvaluatorProber(ctx context.Context, repoDir, targetRepo, ollamaEndpoint
 		return fmt.Errorf("evaluating spec alignment: %w", err)
 	}
 
-	specAlignmentScore.WithLabelValues(targetRepo).Set(float64(evalResult.Percentage))
+	recordAlignmentScore(targetRepo, evalResult.Percentage)
 	fmt.Printf("✓ Alignment Score: %d%% (%s)\n", evalResult.Percentage, evalResult.BadgeMarkdown)
 	if evalResult.ActiveFrontierStage == nil {
 		return fmt.Errorf("expected active frontier stage, got nil")
@@ -331,6 +340,23 @@ func serveMetricsUntilScraped(ctx context.Context, addr string, timeout time.Dur
 	}
 
 	return nil
+}
+
+func recordProberResult(repo, proberMode string, duration time.Duration, runErr error) {
+	statusStr := "success"
+	statusVal := 1.0
+	if runErr != nil {
+		statusStr = "failure"
+		statusVal = 0.0
+	}
+	proberRunsTotal.WithLabelValues(repo, proberMode, statusStr).Inc()
+	proberDurationSeconds.WithLabelValues(repo, proberMode).Observe(duration.Seconds())
+	proberLastDurationSeconds.WithLabelValues(repo, proberMode).Set(duration.Seconds())
+	proberStatus.WithLabelValues(repo, proberMode).Set(statusVal)
+}
+
+func recordAlignmentScore(repo string, score int) {
+	specAlignmentScore.WithLabelValues(repo).Set(float64(score))
 }
 
 func osLines(s string) []string {
