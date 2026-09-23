@@ -1,0 +1,23 @@
+name: Create Pull Request
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Pull Request
+        run: |
+          REF_NAME="${{ github.ref_name }}"
+          BODY="Automated PR created from push to ${REF_NAME}.
+
+          Part of #1"
+          gh pr create --base main --head "$REF_NAME" --title "feat(kv): add basic KV schema and spec" --body "$BODY" || echo "PR already exists"
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
