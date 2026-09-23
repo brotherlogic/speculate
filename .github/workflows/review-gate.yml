@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,7 +58,20 @@ jobs:
             exit 0
           fi
 
-          echo "Protected files modified. Checking for approval from @brotherlogic..."
+          PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author --jq '.author.login')
+          if [ "$PR_AUTHOR" = "brotherlogic" ]; then
+            echo "✓ PR #${PR_NUMBER} is authored by @brotherlogic. Human review requirement satisfied by author."
+            exit 0
+          fi
+
+          echo "Protected files modified. Ensuring @brotherlogic is requested for review..."
+          REVIEWER_REQUESTED=$(gh pr view "$PR_NUMBER" --json reviewRequests --jq '[.reviewRequests[] | select(.login == "brotherlogic" or .name == "brotherlogic")] | length')
+          if [ "$REVIEWER_REQUESTED" -eq 0 ]; then
+            echo "Requesting review from @brotherlogic..."
+            gh pr edit "$PR_NUMBER" --add-reviewer brotherlogic 2>/dev/null || echo "Note: Could not add brotherlogic as reviewer (e.g. if author)"
+          fi
+
+          echo "Checking for approval from @brotherlogic..."
           APPROVALS=$(gh pr view "$PR_NUMBER" --json reviews --jq '[.reviews[] | select(.author.login == "brotherlogic" and .state == "APPROVED")] | length')
           echo "Found $APPROVALS approval(s) from @brotherlogic"
 

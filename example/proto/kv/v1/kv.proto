@@ -4,12 +4,17 @@ package example.kv.v1;
 
 option go_package = "github.com/brotherlogic/speculate/example/proto/kv/v1";
 
-// KV provides basic key-value storage operations.
+// Review Policy:
+// This interface defines the core contract for the example Key-Value store.
+// Any changes to RPC signatures, request/response messages, or error domains
+// require explicit human review and approval by @brotherlogic before merge.
 service KV {
   // Put associates a byte payload with the given key.
+  // Overwrites existing data if key already exists.
   rpc Put(PutRequest) returns (PutResponse);
 
-  // Get retrieves the byte payload for the given key, or returns NOT_FOUND.
+  // Get retrieves the byte payload for the given key.
+  // Returns codes.NotFound (NOT_FOUND) if the key does not exist.
   rpc Get(GetRequest) returns (GetResponse);
 }
 
