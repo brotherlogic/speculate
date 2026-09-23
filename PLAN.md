@@ -52,13 +52,13 @@ flowchart LR
   * Interface with local Ollama LLM endpoint (`deepseek-coder-v2:latest`).
   * Evaluate spec coverage fraction: `Passing Covered Scenarios / Total Spec Scenarios`.
   * Format the coverage badge string for `README.md`.
-* [ ] **Task 2.3: Scenario Card & Test Synthesizer (`pkg/synthesizer`)**
+* [x] **Task 2.3: Scenario Card & Test Synthesizer (`pkg/synthesizer`)**
   * When alignment is `< 100%`, identify the next unexercised requirement on the active frontier.
   * Synthesize a structured Scenario Card (`GIVEN / WHEN / THEN`).
   * Generate an executable Go integration test targeting the gRPC client harness.
   * Run mutation probe to verify the generated test fails against the current un-implemented server (Red).
 
-### 🔍 Self-Reflection Prober 2: Evaluator & Synthesizer Prober
+### 🔍 Self-Reflection Prober 2: Evaluator & Synthesizer Prober (PASSED)
 * **Target:** `go run cmd/prober/main.go --mode=evaluator`
 * **Verification Criteria:**
   * Runs evaluator on `example/specs/kv.md` against an empty `example/tests/`.
