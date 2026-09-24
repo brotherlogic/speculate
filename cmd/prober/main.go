@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/brotherlogic/speculate/pkg/alerter"
 	"github.com/brotherlogic/speculate/pkg/evaluator"
 	"github.com/brotherlogic/speculate/pkg/parser"
 	"github.com/brotherlogic/speculate/pkg/synthesizer"
@@ -61,6 +62,10 @@ var (
 	)
 )
 
+var issueClientFactory = func(token string) alerter.GitHubIssueClient {
+	return alerter.NewRealGitHubClient(token)
+}
+
 func main() {
 	defaultMode := os.Getenv("PROBER_MODE")
 	if defaultMode == "" {
@@ -76,6 +81,11 @@ func main() {
 		defaultOllamaEndpoint = "http://192.168.68.112:11434/v1"
 	}
 	defaultMetricsAddr := os.Getenv("PROBER_METRICS_ADDR")
+	defaultIssueRepo := os.Getenv("PROBER_ISSUE_REPO")
+	if defaultIssueRepo == "" {
+		defaultIssueRepo = "brotherlogic/speculate"
+	}
+	defaultEnableIssueFiling := os.Getenv("PROBER_ENABLE_ISSUE_FILING") != "false"
 
 	mode := flag.String("mode", defaultMode, "Prober execution mode: evaluator, simulation, cluster")
 	targetDir := flag.String("target-dir", defaultTargetDir, "Local target directory of the repository to probe (e.g. /tmp/speculate-kv)")
@@ -83,6 +93,9 @@ func main() {
 	ollamaEndpoint := flag.String("ollama-endpoint", defaultOllamaEndpoint, "Ollama API endpoint")
 	metricsAddr := flag.String("metrics-addr", defaultMetricsAddr, "Optional address to serve Prometheus metrics until scraped (e.g. :8081)")
 	metricsHoldTimeout := flag.Duration("metrics-hold-timeout", 30*time.Second, "Hold duration to wait for Prometheus scrape")
+	issueRepo := flag.String("issue-repo", defaultIssueRepo, "Repository where failure issues should be filed (e.g. brotherlogic/speculate or target)")
+	enableIssueFiling := flag.Bool("enable-issue-filing", defaultEnableIssueFiling, "Enable filing a GitHub issue when the prober fails")
+	githubToken := flag.String("github-token", "", "GitHub token for filing issues (defaults to GH_TOKEN or GITHUB_TOKEN)")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -93,25 +106,31 @@ func main() {
 
 	resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo)
 	if err != nil {
-		log.Fatalf("❌ Failed to resolve target repo: %v", err)
-	}
-	defer cleanup()
+		runErr = fmt.Errorf("resolving target repo: %w", err)
+		log.Printf("❌ Failed to resolve target repo: %v", err)
+	} else {
+		defer cleanup()
 
-	switch *mode {
-	case "evaluator":
-		runErr = runEvaluatorProber(ctx, resolvedDir, *targetRepo, *ollamaEndpoint)
-		if runErr != nil {
-			log.Printf("❌ Prober Failed: %v", runErr)
-		} else {
-			fmt.Println("✅ [PROBER PASS] Target repository evaluated and synthesized successfully!")
+		switch *mode {
+		case "evaluator":
+			runErr = runEvaluatorProber(ctx, resolvedDir, *targetRepo, *ollamaEndpoint)
+			if runErr != nil {
+				log.Printf("❌ Prober Failed: %v", runErr)
+			} else {
+				fmt.Println("✅ [PROBER PASS] Target repository evaluated and synthesized successfully!")
+			}
+		default:
+			runErr = fmt.Errorf("unknown prober mode: %s", *mode)
+			log.Printf("❌ %v", runErr)
 		}
-	default:
-		runErr = fmt.Errorf("unknown prober mode: %s", *mode)
-		log.Printf("❌ %v", runErr)
 	}
 
 	duration := time.Since(start)
 	recordProberResult(*targetRepo, *mode, duration, runErr)
+
+	if runErr != nil && *enableIssueFiling {
+		fileProberIssue(*issueRepo, *mode, *targetRepo, *targetDir, *githubToken, duration, runErr)
+	}
 
 	if *metricsAddr != "" {
 		log.Printf("Serving prober metrics on %s (hold timeout: %v)...", *metricsAddr, *metricsHoldTimeout)
@@ -122,6 +141,42 @@ func main() {
 
 	if runErr != nil {
 		os.Exit(1)
+	}
+}
+
+func fileProberIssue(issueRepo, mode, targetRepo, targetDir, token string, duration time.Duration, runErr error) {
+	resolvedToken := alerter.ResolveToken(token)
+	if resolvedToken == "" {
+		log.Println("⚠️ Warning: no GitHub token found (GH_TOKEN or --github-token); skipping GitHub issue creation")
+		return
+	}
+
+	alertCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := issueClientFactory(resolvedToken)
+	cfg := alerter.ProberAlertConfig{
+		Mode:       mode,
+		TargetRepo: targetRepo,
+		TargetDir:  targetDir,
+		IssueRepo:  issueRepo,
+		Duration:   duration,
+		Err:        runErr,
+		Time:       time.Now().UTC(),
+	}
+
+	alertRes, err := alerter.HandleProberFailure(alertCtx, client, cfg)
+	if err != nil {
+		log.Printf("⚠️ Warning: failed to file GitHub issue on prober failure: %v", err)
+		return
+	}
+
+	if alertRes != nil {
+		if alertRes.Deduplicated {
+			log.Printf("ℹ️ Existing open prober issue #%d found; skipped duplicate issue creation (%s)", alertRes.IssueNumber, alertRes.IssueURL)
+		} else {
+			log.Printf("🚨 Filed GitHub issue #%d for prober failure: %s", alertRes.IssueNumber, alertRes.IssueURL)
+		}
 	}
 }
 
