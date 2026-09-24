@@ -17,11 +17,13 @@ flowchart TD
     C --> D{"User has Admin Access?"}
     D -- Yes --> E["3. Configure GitHub Repo Settings<br/>(auto-merge, branch deletion)"]
     E --> F["4. Configure Collaborator<br/>(invite @brotherlogic-automation)"]
-    F --> G["5. Apply Ruleset 'main'<br/>(CODEOWNERS approval, required checks, squash)"]
-    D -- No --> H["Log notice: admin permissions needed for rulesets"]
-    G --> I["6. Git Commit & Push<br/>(chore: initialize speculate project scaffolding)"]
-    H --> I
-    I --> J["Target Repository Ready for Autonomous Spec Development"]
+    F --> G["5. Git Commit & Push<br/>(chore: initialize speculate project scaffolding)"]
+    D -- No --> H["Log notice: admin permissions needed for repo settings/rulesets"]
+    H --> G
+    G --> I{"User has Admin Access?"}
+    I -- Yes --> J["6. Apply Ruleset 'main'<br/>(CODEOWNERS approval, required checks, squash)"]
+    I -- No --> K["Target Repository Ready for Autonomous Spec Development"]
+    J --> K
 ```
 
 ---
@@ -146,17 +148,18 @@ Configures repository behavior via the GitHub API:
 #### 4. Automation Collaborator Access (Admin)
 Invites `@brotherlogic-automation` (or custom collaborator specified via `--collaborator`) with `push` permission, allowing automated agents to push branches and open PRs.
 
-#### 5. Ruleset Enforcement (Admin)
+#### 5. Git Commit & Push
+- Stages `.github`, `specs`, `proto`, `tests`, and `internal`.
+- Creates a clean Git commit: `chore: initialize speculate project scaffolding`.
+- Pushes the commit to `origin HEAD` (skipped if `--skip-push` is set). Executing this step before branch ruleset enforcement ensures that initial repository scaffolding can be pushed directly without triggering pull request or status check blocks.
+
+#### 6. Ruleset Enforcement (Admin)
 Creates or updates the `main` branch ruleset on GitHub to enforce:
 - **Branch Protection**: Disables branch deletion and non-fast-forward pushes (prevents force-pushing).
 - **Linear History**: Requires linear commit history.
 - **Pull Request Requirements**: Requires CODEOWNERS review for protected paths; allows squash merging.
 - **Required Status Checks**: Requires `test` and `review-gate` checks to pass before merging.
-
-#### 6. Git Commit & Push
-- Stages `.github`, `specs`, `proto`, `tests`, and `internal`.
-- Creates a clean Git commit: `chore: initialize speculate project scaffolding`.
-- Pushes the commit to `origin HEAD` (skipped if `--skip-push` is set).
+*(If an active ruleset named `main` already exists, `speculate init` temporarily pauses enforcement during the push and re-enforces it here).*
 
 ---
 

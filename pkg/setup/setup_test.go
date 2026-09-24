@@ -1,6 +1,8 @@
 package setup
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,3 +178,166 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 		t.Errorf("expected 1 file overwritten, got %v", writtenFourth)
 	}
 }
+
+func TestRun_OrderOfOperations_PushBeforeRulesets(t *testing.T) {
+	tempDir := t.TempDir()
+	var executionOrder []string
+
+	cfg := &Config{
+		RootDir:      tempDir,
+		Repo:         "brotherlogic/test-repo",
+		Collaborator: "brotherlogic-automation",
+		Force:        true,
+		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			return RepoPermissions{Admin: true, Push: true}, nil
+		},
+		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "repo_settings")
+			return nil
+		},
+		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "collaborator")
+			return nil
+		},
+		CommitAndPushFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "git_push")
+			return nil
+		},
+		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "rulesets")
+			return nil
+		},
+	}
+
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	pushIdx := -1
+	rulesetIdx := -1
+	for idx, op := range executionOrder {
+		if op == "git_push" {
+			pushIdx = idx
+		}
+		if op == "rulesets" {
+			rulesetIdx = idx
+		}
+	}
+
+	if pushIdx == -1 {
+		t.Fatalf("git_push was not executed in Run")
+	}
+	if rulesetIdx == -1 {
+		t.Fatalf("rulesets was not executed in Run")
+	}
+
+	// git_push MUST occur before rulesets, otherwise on first push the ruleset
+	// blocks the push with GH013 repository rule violations.
+	if pushIdx > rulesetIdx {
+		t.Fatalf("git_push (index %d) occurred after rulesets (index %d); git_push must occur before rulesets to avoid GH013 push rejection on first push. Order: %v", pushIdx, rulesetIdx, executionOrder)
+	}
+}
+
+func TestRun_ExistingActiveRuleset_PausedDuringPush(t *testing.T) {
+	tempDir := t.TempDir()
+	var events []string
+
+	cfg := &Config{
+		RootDir:      tempDir,
+		Repo:         "brotherlogic/test-repo",
+		Collaborator: "brotherlogic-automation",
+		Force:        true,
+		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			return RepoPermissions{Admin: true, Push: true}, nil
+		},
+		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		CheckExistingRulesetFn: func(ctx context.Context, cfg *Config, name string) (int64, string, error) {
+			return 12345, "active", nil
+		},
+		SetRulesetEnforceFn: func(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error {
+			events = append(events, "enforce_"+enforcement)
+			return nil
+		},
+		CommitAndPushFunc: func(ctx context.Context, cfg *Config) error {
+			events = append(events, "git_push")
+			return nil
+		},
+		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
+			events = append(events, "ruleset_configured")
+			return nil
+		},
+	}
+
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	expectedOrder := []string{"enforce_disabled", "git_push", "ruleset_configured"}
+	if len(events) != len(expectedOrder) {
+		t.Fatalf("expected events %v, got %v", expectedOrder, events)
+	}
+	for i, exp := range expectedOrder {
+		if events[i] != exp {
+			t.Errorf("expected event[%d] to be %s, got %s (full events: %v)", i, exp, events[i], events)
+		}
+	}
+}
+
+func TestRun_ExistingActiveRuleset_RestoredOnPushError(t *testing.T) {
+	tempDir := t.TempDir()
+	var events []string
+
+	cfg := &Config{
+		RootDir:      tempDir,
+		Repo:         "brotherlogic/test-repo",
+		Collaborator: "brotherlogic-automation",
+		Force:        true,
+		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			return RepoPermissions{Admin: true, Push: true}, nil
+		},
+		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		CheckExistingRulesetFn: func(ctx context.Context, cfg *Config, name string) (int64, string, error) {
+			return 12345, "active", nil
+		},
+		SetRulesetEnforceFn: func(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error {
+			events = append(events, "enforce_"+enforcement)
+			return nil
+		},
+		CommitAndPushFunc: func(ctx context.Context, cfg *Config) error {
+			events = append(events, "git_push")
+			return errors.New("network failure during push")
+		},
+		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
+			events = append(events, "ruleset_configured")
+			return nil
+		},
+	}
+
+	err := Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected Run to fail on push error, got nil")
+	}
+
+	// Should disable before push, attempt push, then restore to active via defer
+	expectedOrder := []string{"enforce_disabled", "git_push", "enforce_active"}
+	if len(events) != len(expectedOrder) {
+		t.Fatalf("expected events %v, got %v", expectedOrder, events)
+	}
+	for i, exp := range expectedOrder {
+		if events[i] != exp {
+			t.Errorf("expected event[%d] to be %s, got %s (full events: %v)", i, exp, events[i], events)
+		}
+	}
+}
+
+
