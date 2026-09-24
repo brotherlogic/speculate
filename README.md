@@ -36,16 +36,54 @@ flowchart TD
 
 ---
 
-### Building the CLI
+### Installation
 
-To compile the `speculate` CLI binary from this repository:
+To use `speculate` from any target repository or machine without cloning the `speculate` codebase, choose one of the following methods:
+
+#### Option 1: Install with `go install` (Recommended)
+
+Install the `speculate` binary directly into your `$GOPATH/bin`:
 
 ```bash
-# Build the binary into bin/speculate
-go build -o bin/speculate ./cmd/speculate
+go install github.com/brotherlogic/speculate/cmd/speculate@latest
+```
 
-# Or run directly via go run
-go run ./cmd/speculate init --help
+Ensure `$(go env GOPATH)/bin` is in your `PATH` (e.g. `export PATH="$PATH:$(go env GOPATH)/bin"`). You can then run `speculate init` from any repository:
+
+```bash
+speculate init --help
+```
+
+#### Option 2: Run On-The-Fly with `go run`
+
+Execute `speculate init` directly without installing any binary:
+
+```bash
+cd /path/to/my-target-repo
+go run github.com/brotherlogic/speculate/cmd/speculate@latest init [flags]
+```
+
+#### Option 3: Run via Docker (Zero local Go installation required)
+
+Run the official container image from GitHub Container Registry:
+
+```bash
+cd /path/to/my-target-repo
+
+docker run --rm \
+  -v "$(pwd):/repo" \
+  -w /repo \
+  -e GH_TOKEN="${GH_TOKEN:-$(gh auth token)}" \
+  ghcr.io/brotherlogic/speculate:latest \
+  ./speculate init [flags]
+```
+
+#### Option 4: Build from Source
+
+```bash
+git clone https://github.com/brotherlogic/speculate.git /tmp/speculate
+cd /tmp/speculate
+go build -o /usr/local/bin/speculate ./cmd/speculate
 ```
 
 ---
@@ -163,5 +201,12 @@ Once initialized, your repository is ready for autonomous spec-driven developmen
 3. **Run the Speculate Prober**:
    Verify alignment and synthesize the first test:
    ```bash
-   go run ./cmd/prober --mode=evaluator --target-repo=https://github.com/<owner>/<repo>
+   # Via go run (without cloning speculate)
+   go run github.com/brotherlogic/speculate/cmd/prober@latest \
+     --mode=evaluator \
+     --target-repo=https://github.com/<owner>/<repo>
+
+   # Or via Docker
+   docker run --rm ghcr.io/brotherlogic/speculate:latest \
+     ./prober --mode=evaluator --target-repo=https://github.com/<owner>/<repo>
    ```
