@@ -23,6 +23,15 @@ type Config struct {
 	Force        bool
 	SkipPush     bool
 	PromptFunc   func(path string) bool
+
+	// Testing hooks
+	CheckPermissionsFunc   func(ctx context.Context, cfg *Config) (RepoPermissions, error)
+	ConfigureRepoFunc      func(ctx context.Context, cfg *Config) error
+	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
+	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
+	ConfigureRulesetsFunc  func(ctx context.Context, cfg *Config) error
+	CheckExistingRulesetFn func(ctx context.Context, cfg *Config, name string) (int64, string, error)
+	SetRulesetEnforceFn    func(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error
 }
 
 // RepoPermissions captures repository access permissions from GitHub API.
@@ -248,6 +257,47 @@ type RulesetRefName struct {
 	Exclude []string `json:"exclude"`
 }
 
+// CheckExistingRuleset returns the ID and enforcement status of a ruleset by name, or 0 if not found.
+func CheckExistingRuleset(ctx context.Context, cfg *Config, name string) (int64, string, error) {
+	listCmd := ghCmd(ctx, cfg, "api", fmt.Sprintf("repos/%s/rulesets", cfg.Repo))
+	listOut, err := listCmd.Output()
+	if err != nil {
+		return 0, "", fmt.Errorf("listing rulesets: %w", err)
+	}
+	var existingRulesets []struct {
+		ID          int64  `json:"id"`
+		Name        string `json:"name"`
+		Enforcement string `json:"enforcement"`
+	}
+	if err := json.Unmarshal(listOut, &existingRulesets); err != nil {
+		return 0, "", fmt.Errorf("parsing rulesets: %w", err)
+	}
+	for _, r := range existingRulesets {
+		if r.Name == name {
+			return r.ID, r.Enforcement, nil
+		}
+	}
+	return 0, "", nil
+}
+
+// SetRulesetEnforcement updates the enforcement status of a ruleset (e.g., "active", "disabled").
+func SetRulesetEnforcement(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error {
+	payload := map[string]string{
+		"enforcement": enforcement,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshaling enforcement payload: %w", err)
+	}
+	cmd := ghCmd(ctx, cfg, "api", fmt.Sprintf("repos/%s/rulesets/%d", cfg.Repo, rulesetID), "-X", "PATCH", "--input", "-")
+	cmd.Stdin = bytes.NewReader(payloadBytes)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("setting ruleset enforcement to %s: %s: %w", enforcement, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 // ConfigureRulesets creates or updates the default branch ruleset.
 func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 	ruleset := RulesetPayload{
@@ -297,22 +347,11 @@ func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 	}
 
 	// Check if ruleset named "main" already exists
-	listCmd := ghCmd(ctx, cfg, "api", fmt.Sprintf("repos/%s/rulesets", cfg.Repo))
-	listOut, err := listCmd.Output()
-	var existingRulesets []struct {
-		ID   int64  `json:"id"`
-		Name string `json:"name"`
+	checkFn := CheckExistingRuleset
+	if cfg.CheckExistingRulesetFn != nil {
+		checkFn = cfg.CheckExistingRulesetFn
 	}
-
-	var existingID int64
-	if err == nil && json.Unmarshal(listOut, &existingRulesets) == nil {
-		for _, r := range existingRulesets {
-			if r.Name == "main" {
-				existingID = r.ID
-				break
-			}
-		}
-	}
+	existingID, _, _ := checkFn(ctx, cfg, "main")
 
 	var applyCmd *exec.Cmd
 	if existingID > 0 {
@@ -403,15 +442,24 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	// Check permissions on the target repository
-	perms, err := CheckPermissions(ctx, cfg)
+	checkPerms := CheckPermissions
+	if cfg.CheckPermissionsFunc != nil {
+		checkPerms = cfg.CheckPermissionsFunc
+	}
+	perms, err := checkPerms(ctx, cfg)
 	if err != nil {
 		fmt.Printf("⚠️  Could not determine repository permissions: %v\n", err)
 	}
 
+	var pausedRulesetID int64
 	if perms.Admin {
 		// 3. Repo Settings
 		fmt.Printf("3. Configuring repository settings on GitHub (%s)... ", cfg.Repo)
-		if err := ConfigureRepoSettings(ctx, cfg); err != nil {
+		cfgRepo := ConfigureRepoSettings
+		if cfg.ConfigureRepoFunc != nil {
+			cfgRepo = cfg.ConfigureRepoFunc
+		}
+		if err := cfgRepo(ctx, cfg); err != nil {
 			fmt.Printf("⚠️  Warning: %v\n", err)
 		} else {
 			fmt.Println("✓ Auto-merge & branch deletion enabled")
@@ -420,33 +468,80 @@ func Run(ctx context.Context, cfg *Config) error {
 		// 4. Collaborator
 		if cfg.Collaborator != "" {
 			fmt.Printf("4. Ensuring collaborator access for @%s... ", cfg.Collaborator)
-			if err := ConfigureCollaborator(ctx, cfg); err != nil {
+			cfgCollab := ConfigureCollaborator
+			if cfg.ConfigureCollabFunc != nil {
+				cfgCollab = cfg.ConfigureCollabFunc
+			}
+			if err := cfgCollab(ctx, cfg); err != nil {
 				fmt.Printf("⚠️  Warning: %v\n", err)
 			} else {
 				fmt.Println("✓ Done")
 			}
 		}
 
-		// 5. Ruleset
-		fmt.Print("5. Configuring GitHub Ruleset for default branch... ")
-		if err := ConfigureRulesets(ctx, cfg); err != nil {
-			return fmt.Errorf("failed configuring rulesets: %w", err)
+		// If a ruleset named "main" already exists and is active, temporarily pause it
+		// during git push so the push is not rejected by GH013.
+		checkRulesFn := CheckExistingRuleset
+		if cfg.CheckExistingRulesetFn != nil {
+			checkRulesFn = cfg.CheckExistingRulesetFn
 		}
-		fmt.Println("✓ Ruleset 'main' enforced (CODEOWNERS review, required checks, squash merge)")
+		existingID, enforcement, err := checkRulesFn(ctx, cfg, "main")
+		if err == nil && existingID > 0 && enforcement == "active" {
+			setEnforceFn := SetRulesetEnforcement
+			if cfg.SetRulesetEnforceFn != nil {
+				setEnforceFn = cfg.SetRulesetEnforceFn
+			}
+			if err := setEnforceFn(ctx, cfg, existingID, "disabled"); err == nil {
+				pausedRulesetID = existingID
+			}
+		}
 	} else {
-		fmt.Printf("3-5. Note: Admin permissions required for repository settings, collaborators, and rulesets on %s.\n", cfg.Repo)
-		fmt.Printf("     Current token has push=%v, admin=%v. Run 'speculate init --token=<admin-token>' as repository owner to apply rulesets.\n", perms.Push, perms.Admin)
+		fmt.Printf("3-4. Note: Admin permissions required for repository settings and collaborators on %s.\n", cfg.Repo)
 	}
 
-	// 6. Git Push
+	// Ensure any paused ruleset is restored if an error occurs before ConfigureRulesets
+	if pausedRulesetID > 0 {
+		defer func() {
+			if pausedRulesetID > 0 {
+				setEnforceFn := SetRulesetEnforcement
+				if cfg.SetRulesetEnforceFn != nil {
+					setEnforceFn = cfg.SetRulesetEnforceFn
+				}
+				_ = setEnforceFn(ctx, cfg, pausedRulesetID, "active")
+			}
+		}()
+	}
+
+	// 5. Git Push (executed BEFORE ruleset enforcement to prevent GH013 push rejection)
 	if !cfg.SkipPush {
-		fmt.Print("6. Committing and pushing scaffolding changes to remote... ")
-		if err := GitCommitAndPush(ctx, cfg); err != nil {
+		fmt.Print("5. Committing and pushing scaffolding changes to remote... ")
+		pushFn := GitCommitAndPush
+		if cfg.CommitAndPushFunc != nil {
+			pushFn = cfg.CommitAndPushFunc
+		}
+		if err := pushFn(ctx, cfg); err != nil {
 			return fmt.Errorf("failed git commit/push: %w", err)
 		}
 		fmt.Println("✓ Pushed to origin")
 	} else {
-		fmt.Println("6. Skipping git push (--skip-push specified)")
+		fmt.Println("5. Skipping git push (--skip-push specified)")
+	}
+
+	// 6. Ruleset (configured AFTER git push has populated the branch)
+	if perms.Admin {
+		fmt.Print("6. Configuring GitHub Ruleset for default branch... ")
+		cfgRules := ConfigureRulesets
+		if cfg.ConfigureRulesetsFunc != nil {
+			cfgRules = cfg.ConfigureRulesetsFunc
+		}
+		if err := cfgRules(ctx, cfg); err != nil {
+			return fmt.Errorf("failed configuring rulesets: %w", err)
+		}
+		pausedRulesetID = 0 // Successfully configured and enforced
+		fmt.Println("✓ Ruleset 'main' enforced (CODEOWNERS review, required checks, squash merge)")
+	} else {
+		fmt.Printf("6. Note: Admin permissions required to configure branch ruleset on %s.\n", cfg.Repo)
+		fmt.Printf("   Current token has push=%v, admin=%v. Run 'speculate init --token=<admin-token>' as repository owner to apply rulesets.\n", perms.Push, perms.Admin)
 	}
 
 	fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)
