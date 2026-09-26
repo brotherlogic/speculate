@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -336,6 +337,164 @@ func TestRun_ExistingActiveRuleset_RestoredOnPushError(t *testing.T) {
 	for i, exp := range expectedOrder {
 		if events[i] != exp {
 			t.Errorf("expected event[%d] to be %s, got %s (full events: %v)", i, exp, events[i], events)
+		}
+	}
+}
+
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	cmds := [][]string{
+		{"git", "init"},
+		{"git", "config", "user.name", "Test User"},
+		{"git", "config", "user.email", "test@example.com"},
+	}
+	for _, args := range cmds {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("failed running %v in %s: %s: %v", args, dir, string(out), err)
+		}
+	}
+}
+
+func TestCheckScaffoldingChanges_CleanTree(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	if err := SetupDirectories(cfg); err != nil {
+		t.Fatalf("SetupDirectories failed: %v", err)
+	}
+	if _, err := SetupTemplateFiles(cfg); err != nil {
+		t.Fatalf("SetupTemplateFiles failed: %v", err)
+	}
+
+	// Commit initial scaffolding
+	cmdAdd := exec.Command("git", "add", ".")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+
+	hasChanges, err := CheckScaffoldingChanges(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("CheckScaffoldingChanges returned unexpected error: %v", err)
+	}
+	if hasChanges {
+		t.Errorf("expected CheckScaffoldingChanges to return false on clean tree, got true")
+	}
+}
+
+func TestCheckScaffoldingChanges_WithChanges(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	if err := SetupDirectories(cfg); err != nil {
+		t.Fatalf("SetupDirectories failed: %v", err)
+	}
+	if _, err := SetupTemplateFiles(cfg); err != nil {
+		t.Fatalf("SetupTemplateFiles failed: %v", err)
+	}
+
+	// Commit initial scaffolding
+	cmdAdd := exec.Command("git", "add", ".")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+
+	// Add a new file to specs/
+	newSpecPath := filepath.Join(tempDir, "specs", "feature.md")
+	if err := os.WriteFile(newSpecPath, []byte("# Feature Spec"), 0644); err != nil {
+		t.Fatalf("writing new spec file: %v", err)
+	}
+
+	hasChanges, err := CheckScaffoldingChanges(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("CheckScaffoldingChanges returned unexpected error: %v", err)
+	}
+	if !hasChanges {
+		t.Errorf("expected CheckScaffoldingChanges to return true when changes exist, got false")
+	}
+}
+
+func TestCheckScaffoldingChanges_IgnoresNonScaffolding(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	if err := SetupDirectories(cfg); err != nil {
+		t.Fatalf("SetupDirectories failed: %v", err)
+	}
+	if _, err := SetupTemplateFiles(cfg); err != nil {
+		t.Fatalf("SetupTemplateFiles failed: %v", err)
+	}
+
+	// Commit initial scaffolding
+	cmdAdd := exec.Command("git", "add", ".")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+
+	// Create an untracked file outside the scaffolding directories
+	unrelatedFile := filepath.Join(tempDir, "unrelated.txt")
+	if err := os.WriteFile(unrelatedFile, []byte("unrelated data"), 0644); err != nil {
+		t.Fatalf("writing unrelated file: %v", err)
+	}
+
+	hasChanges, err := CheckScaffoldingChanges(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("CheckScaffoldingChanges returned unexpected error: %v", err)
+	}
+	if hasChanges {
+		t.Errorf("expected CheckScaffoldingChanges to return false when only non-scaffolding changes exist, got true")
+	}
+}
+
+func TestConfig_CheckScaffoldingChangesHook(t *testing.T) {
+	hookCalled := false
+	cfg := &Config{
+		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
+			hookCalled = true
+			return true, nil
+		},
+	}
+	if cfg.CheckScaffoldingChangesFunc != nil {
+		res, err := cfg.CheckScaffoldingChangesFunc(context.Background(), cfg)
+		if err != nil || !res || !hookCalled {
+			t.Fatalf("expected hook to be called successfully")
 		}
 	}
 }
