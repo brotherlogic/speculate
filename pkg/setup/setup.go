@@ -27,6 +27,7 @@ type Config struct {
 	// Testing hooks
 	CheckPermissionsFunc        func(ctx context.Context, cfg *Config) (RepoPermissions, error)
 	CheckScaffoldingChangesFunc func(ctx context.Context, cfg *Config) (bool, error)
+	CommitAndPushBranchFunc     func(ctx context.Context, cfg *Config, branchName string) error
 	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
@@ -433,6 +434,34 @@ func GitCommitAndPush(ctx context.Context, cfg *Config) error {
 	pushCmd := exec.CommandContext(ctx, "git", "-C", cfg.RootDir, "push", "origin", "HEAD")
 	if out, err := pushCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git push failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
+}
+
+// GitCommitAndPushBranch creates and switches to a dedicated branch, commits staged files, and pushes the branch to remote origin.
+func GitCommitAndPushBranch(ctx context.Context, cfg *Config, branchName string) error {
+	rootDir := cfg.RootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	// 1. Switch and create branch: git checkout -b <branchName>
+	checkoutCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "checkout", "-b", branchName)
+	if out, err := checkoutCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git checkout -b %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
+	}
+
+	// 2. Commit staged files: git commit -m "chore: initialize speculate project scaffolding"
+	commitCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "commit", "-m", "chore: initialize speculate project scaffolding")
+	if out, err := commitCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git commit failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// 3. Push branch: git push origin <branchName>
+	pushCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "push", "origin", branchName)
+	if out, err := pushCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git push origin %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
 	}
 
 	return nil
