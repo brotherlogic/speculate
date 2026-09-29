@@ -25,8 +25,9 @@ type Config struct {
 	PromptFunc   func(path string) bool
 
 	// Testing hooks
-	CheckPermissionsFunc   func(ctx context.Context, cfg *Config) (RepoPermissions, error)
-	ConfigureRepoFunc      func(ctx context.Context, cfg *Config) error
+	CheckPermissionsFunc        func(ctx context.Context, cfg *Config) (RepoPermissions, error)
+	CheckScaffoldingChangesFunc func(ctx context.Context, cfg *Config) (bool, error)
+	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc  func(ctx context.Context, cfg *Config) error
@@ -367,6 +368,44 @@ func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 	}
 
 	return nil
+}
+
+// CheckScaffoldingChanges stages scaffolding directories and checks if there are pending staged changes.
+func CheckScaffoldingChanges(ctx context.Context, cfg *Config) (bool, error) {
+	rootDir := cfg.RootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	// 1. Stage scaffolding paths
+	paths := []string{".github", "specs", "proto", "tests", "internal"}
+	var existingPaths []string
+	for _, p := range paths {
+		if _, err := os.Stat(filepath.Join(rootDir, p)); err == nil {
+			existingPaths = append(existingPaths, p)
+		}
+	}
+
+	if len(existingPaths) > 0 {
+		args := append([]string{"-C", rootDir, "add"}, existingPaths...)
+		addCmd := exec.CommandContext(ctx, "git", args...)
+		if out, err := addCmd.CombinedOutput(); err != nil {
+			return false, fmt.Errorf("git add failed: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	// 2. Run git diff --cached --quiet to detect pending staged changes
+	diffCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "diff", "--cached", "--quiet")
+	if err := diffCmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("git diff --cached --quiet failed: %w", err)
+	}
+
+	// 3. Return false if tree is clean
+	return false, nil
 }
 
 // GitCommitAndPush stages changes, commits, and performs a single push to remote.
