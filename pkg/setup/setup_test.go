@@ -671,5 +671,177 @@ func TestConfig_CommitAndPushBranchHook(t *testing.T) {
 	}
 }
 
+func setupMockGH(t *testing.T, scriptBody string) (string, string) {
+	tempBin := t.TempDir()
+	logFile := filepath.Join(tempBin, "gh_args.log")
+	ghPath := filepath.Join(tempBin, "gh")
+	script := "#!/bin/sh\necho \"$@\" >> \"" + logFile + "\"\n" + scriptBody + "\n"
+	if err := os.WriteFile(ghPath, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to create mock gh binary: %v", err)
+	}
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", tempBin+string(os.PathListSeparator)+origPath)
+	return ghPath, logFile
+}
+
+func TestCreatePullRequest_HookInvocation(t *testing.T) {
+	hookCalled := false
+	var gotBranch, gotTitle, gotBody string
+
+	cfg := &Config{
+		CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+			hookCalled = true
+			gotBranch = branchName
+			gotTitle = title
+			gotBody = body
+			return "https://github.com/brotherlogic/test-repo/pull/99", nil
+		},
+	}
+
+	url, err := CreatePullRequest(context.Background(), cfg, "feature/my-branch")
+	if err != nil {
+		t.Fatalf("unexpected error from CreatePullRequest: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected CreatePRFunc hook to be called")
+	}
+	if gotBranch != "feature/my-branch" {
+		t.Errorf("expected branch %q, got %q", "feature/my-branch", gotBranch)
+	}
+	if gotTitle != "chore: initialize speculate project scaffolding" {
+		t.Errorf("expected title %q, got %q", "chore: initialize speculate project scaffolding", gotTitle)
+	}
+	if gotBody != "Initial speculate scaffolding (directory structure, GitHub workflows, and CODEOWNERS)." {
+		t.Errorf("expected body to match default scaffolding description, got %q", gotBody)
+	}
+	if url != "https://github.com/brotherlogic/test-repo/pull/99" {
+		t.Errorf("expected URL %q, got %q", "https://github.com/brotherlogic/test-repo/pull/99", url)
+	}
+}
+
+func TestCreatePullRequest_EmptyBranch(t *testing.T) {
+	cfg := &Config{}
+	_, err := CreatePullRequest(context.Background(), cfg, "")
+	if err == nil {
+		t.Errorf("expected error when branchName is empty, got nil")
+	}
+}
+
+func TestCreatePullRequest_CommandExecutionAndURLParsing(t *testing.T) {
+	_, logFile := setupMockGH(t, "echo 'https://github.com/brotherlogic/test-repo/pull/42'")
+
+	cfg := &Config{RootDir: t.TempDir()}
+	url, err := CreatePullRequest(context.Background(), cfg, "feature/init-branch")
+	if err != nil {
+		t.Fatalf("unexpected error from CreatePullRequest: %v", err)
+	}
+	if url != "https://github.com/brotherlogic/test-repo/pull/42" {
+		t.Errorf("expected url %q, got %q", "https://github.com/brotherlogic/test-repo/pull/42", url)
+	}
+
+	loggedArgsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed reading mock gh args log: %v", err)
+	}
+	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
+	expectedArgs := "pr create --base main --head feature/init-branch --title chore: initialize speculate project scaffolding --body Initial speculate scaffolding (directory structure, GitHub workflows, and CODEOWNERS)."
+	if loggedArgs != expectedArgs {
+		t.Errorf("expected gh command args:\n%q\ngot:\n%q", expectedArgs, loggedArgs)
+	}
+}
+
+func TestCreatePullRequest_MultilineOutputURLParsing(t *testing.T) {
+	multilineScript := "echo 'Creating pull request for feature/init-branch into main in brotherlogic/test-repo'\necho 'https://github.com/brotherlogic/test-repo/pull/88'\necho ''"
+	setupMockGH(t, multilineScript)
+
+	cfg := &Config{RootDir: t.TempDir()}
+	url, err := CreatePullRequest(context.Background(), cfg, "feature/init-branch")
+	if err != nil {
+		t.Fatalf("unexpected error from CreatePullRequest: %v", err)
+	}
+	if url != "https://github.com/brotherlogic/test-repo/pull/88" {
+		t.Errorf("expected url %q, got %q", "https://github.com/brotherlogic/test-repo/pull/88", url)
+	}
+}
+
+func TestCreatePullRequest_CommandFailure(t *testing.T) {
+	setupMockGH(t, "echo 'GraphQL error: A pull request already exists' >&2\nexit 1")
+
+	cfg := &Config{RootDir: t.TempDir()}
+	_, err := CreatePullRequest(context.Background(), cfg, "feature/init-branch")
+	if err == nil {
+		t.Fatalf("expected error when gh pr create fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "gh pr create failed") {
+		t.Errorf("expected error message to contain 'gh pr create failed', got %v", err)
+	}
+}
+
+func TestEnableAutoMerge_HookInvocation(t *testing.T) {
+	hookCalled := false
+	var gotURL string
+
+	cfg := &Config{
+		EnableAutoMergeFunc: func(ctx context.Context, cfg *Config, prURL string) error {
+			hookCalled = true
+			gotURL = prURL
+			return nil
+		},
+	}
+
+	err := EnableAutoMerge(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42")
+	if err != nil {
+		t.Fatalf("unexpected error from EnableAutoMerge: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected EnableAutoMergeFunc hook to be called")
+	}
+	if gotURL != "https://github.com/brotherlogic/test-repo/pull/42" {
+		t.Errorf("expected URL %q, got %q", "https://github.com/brotherlogic/test-repo/pull/42", gotURL)
+	}
+}
+
+func TestEnableAutoMerge_EmptyURL(t *testing.T) {
+	cfg := &Config{}
+	err := EnableAutoMerge(context.Background(), cfg, "")
+	if err == nil {
+		t.Errorf("expected error when prURL is empty, got nil")
+	}
+}
+
+func TestEnableAutoMerge_CommandExecution(t *testing.T) {
+	_, logFile := setupMockGH(t, "exit 0")
+
+	cfg := &Config{RootDir: t.TempDir()}
+	err := EnableAutoMerge(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42")
+	if err != nil {
+		t.Fatalf("unexpected error from EnableAutoMerge: %v", err)
+	}
+
+	loggedArgsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed reading mock gh args log: %v", err)
+	}
+	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
+	expectedArgs := "pr merge https://github.com/brotherlogic/test-repo/pull/42 --auto --squash"
+	if loggedArgs != expectedArgs {
+		t.Errorf("expected gh command args:\n%q\ngot:\n%q", expectedArgs, loggedArgs)
+	}
+}
+
+func TestEnableAutoMerge_CommandFailure(t *testing.T) {
+	setupMockGH(t, "echo 'GraphQL error: Auto-merge is not allowed for this repository' >&2\nexit 1")
+
+	cfg := &Config{RootDir: t.TempDir()}
+	err := EnableAutoMerge(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42")
+	if err == nil {
+		t.Fatalf("expected error when gh pr merge fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "gh pr merge failed") {
+		t.Errorf("expected error message to contain 'gh pr merge failed', got %v", err)
+	}
+}
+
+
 
 
