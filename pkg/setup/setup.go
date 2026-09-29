@@ -28,6 +28,8 @@ type Config struct {
 	CheckPermissionsFunc        func(ctx context.Context, cfg *Config) (RepoPermissions, error)
 	CheckScaffoldingChangesFunc func(ctx context.Context, cfg *Config) (bool, error)
 	CommitAndPushBranchFunc     func(ctx context.Context, cfg *Config, branchName string) error
+	CreatePRFunc                func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error)
+	EnableAutoMergeFunc         func(ctx context.Context, cfg *Config, prURL string) error
 	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
@@ -462,6 +464,63 @@ func GitCommitAndPushBranch(ctx context.Context, cfg *Config, branchName string)
 	pushCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "push", "origin", branchName)
 	if out, err := pushCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git push origin %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
+}
+
+// CreatePullRequest creates a pull request for the feature branch targeting main.
+func CreatePullRequest(ctx context.Context, cfg *Config, branchName string) (string, error) {
+	if branchName == "" {
+		return "", errors.New("branchName cannot be empty")
+	}
+
+	title := "chore: initialize speculate project scaffolding"
+	body := "Initial speculate scaffolding (directory structure, GitHub workflows, and CODEOWNERS)."
+
+	if cfg.CreatePRFunc != nil {
+		return cfg.CreatePRFunc(ctx, cfg, branchName, title, body)
+	}
+
+	cmd := ghCmd(ctx, cfg, "pr", "create", "--base", "main", "--head", branchName, "--title", title, "--body", body)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr create failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var prURL string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+			prURL = trimmed
+			break
+		}
+	}
+	if prURL == "" {
+		prURL = strings.TrimSpace(string(out))
+	}
+	if prURL == "" {
+		return "", errors.New("gh pr create returned empty URL")
+	}
+
+	return prURL, nil
+}
+
+// EnableAutoMerge enables squash auto-merge on the specified pull request.
+func EnableAutoMerge(ctx context.Context, cfg *Config, prURL string) error {
+	if prURL == "" {
+		return errors.New("prURL cannot be empty")
+	}
+
+	if cfg.EnableAutoMergeFunc != nil {
+		return cfg.EnableAutoMergeFunc(ctx, cfg, prURL)
+	}
+
+	cmd := ghCmd(ctx, cfg, "pr", "merge", prURL, "--auto", "--squash")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh pr merge failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
 	return nil
