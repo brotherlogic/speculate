@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseGitRepoFromURL(t *testing.T) {
@@ -841,6 +842,172 @@ func TestEnableAutoMerge_CommandFailure(t *testing.T) {
 		t.Errorf("expected error message to contain 'gh pr merge failed', got %v", err)
 	}
 }
+
+func TestPollPRStatus_HookInvocation(t *testing.T) {
+	hookCalled := false
+	var gotURL string
+	var gotTimeout time.Duration
+
+	cfg := &Config{
+		PollPRStatusFunc: func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+			hookCalled = true
+			gotURL = prURL
+			gotTimeout = timeout
+			return nil
+		},
+	}
+
+	err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected PollPRStatusFunc hook to be called")
+	}
+	if gotURL != "https://github.com/brotherlogic/test-repo/pull/42" {
+		t.Errorf("expected URL %q, got %q", "https://github.com/brotherlogic/test-repo/pull/42", gotURL)
+	}
+	if gotTimeout != 5*time.Minute {
+		t.Errorf("expected timeout %v, got %v", 5*time.Minute, gotTimeout)
+	}
+}
+
+func TestPollPRStatus_EmptyURL(t *testing.T) {
+	cfg := &Config{}
+	err := PollPRStatus(context.Background(), cfg, "", time.Minute)
+	if err == nil {
+		t.Errorf("expected error when prURL is empty, got nil")
+	}
+}
+
+func TestPollPRStatus_SuccessOnMerge(t *testing.T) {
+	_, logFile := setupMockGH(t, `echo '{"state":"MERGED","statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}]}'`)
+
+	cfg := &Config{RootDir: t.TempDir()}
+	err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	loggedArgsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed reading mock gh args log: %v", err)
+	}
+	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
+	expectedArgs := "pr view https://github.com/brotherlogic/test-repo/pull/42 --json state,statusCheckRollup"
+	if loggedArgs != expectedArgs {
+		t.Errorf("expected gh command args %q, got %q", expectedArgs, loggedArgs)
+	}
+}
+
+func TestPollPRStatus_LoopUntilMerge(t *testing.T) {
+	tempDir := t.TempDir()
+	counterFile := filepath.Join(tempDir, "poll_count")
+	script := `
+COUNT=0
+if [ -f "` + counterFile + `" ]; then
+  COUNT=$(cat "` + counterFile + `")
+fi
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "` + counterFile + `"
+if [ "$COUNT" -eq 1 ]; then
+  echo '{"state":"OPEN","statusCheckRollup":[{"name":"test","status":"IN_PROGRESS","conclusion":""}]}'
+else
+  echo '{"state":"MERGED","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}]}'
+fi
+`
+	setupMockGH(t, script)
+
+	cfg := &Config{
+		RootDir:      t.TempDir(),
+		PollInterval: 10 * time.Millisecond,
+	}
+	err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 5*time.Second)
+	if err != nil {
+		t.Fatalf("expected loop to succeed on merge, got: %v", err)
+	}
+}
+
+func TestPollPRStatus_AbortOnCheckFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		conclusion string
+		state      string
+	}{
+		{name: "failure conclusion", conclusion: "FAILURE"},
+		{name: "timed_out conclusion", conclusion: "TIMED_OUT"},
+		{name: "cancelled conclusion", conclusion: "CANCELLED"},
+		{name: "failure state", state: "FAILURE"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			jsonOutput := `{"state":"OPEN","statusCheckRollup":[{"name":"test","conclusion":"` + tc.conclusion + `","state":"` + tc.state + `"}]}`
+			setupMockGH(t, `echo '`+jsonOutput+`'`)
+
+			cfg := &Config{
+				RootDir:      t.TempDir(),
+				PollInterval: 10 * time.Millisecond,
+			}
+			err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 5*time.Second)
+			if err == nil {
+				t.Fatalf("expected error on check failure, got nil")
+			}
+			if !strings.Contains(err.Error(), "test") {
+				t.Errorf("expected error message to mention failing check name 'test', got %v", err)
+			}
+		})
+	}
+}
+
+func TestPollPRStatus_ClosedPRFailure(t *testing.T) {
+	setupMockGH(t, `echo '{"state":"CLOSED","statusCheckRollup":[]}'`)
+
+	cfg := &Config{
+		RootDir:      t.TempDir(),
+		PollInterval: 10 * time.Millisecond,
+	}
+	err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 5*time.Second)
+	if err == nil {
+		t.Fatalf("expected error when PR is closed, got nil")
+	}
+	if !strings.Contains(err.Error(), "closed without merging") {
+		t.Errorf("expected error message to contain 'closed without merging', got %v", err)
+	}
+}
+
+func TestPollPRStatus_TimeoutHandling(t *testing.T) {
+	setupMockGH(t, `echo '{"state":"OPEN","statusCheckRollup":[]}'`)
+
+	cfg := &Config{
+		RootDir:      t.TempDir(),
+		PollInterval: 10 * time.Millisecond,
+	}
+	err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 50*time.Millisecond)
+	if err == nil {
+		t.Fatalf("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "timed out") && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected timeout error, got %v", err)
+	}
+}
+
+func TestPollPRStatus_CommandFailure(t *testing.T) {
+	setupMockGH(t, `echo "GraphQL error: Could not resolve to a PullRequest" >&2; exit 1`)
+
+	cfg := &Config{
+		RootDir:      t.TempDir(),
+		PollInterval: 10 * time.Millisecond,
+	}
+	err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 5*time.Second)
+	if err == nil {
+		t.Fatalf("expected error on command failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "gh pr view failed") {
+		t.Errorf("expected error to mention 'gh pr view failed', got %v", err)
+	}
+}
+
 
 
 
