@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Config encapsulates configuration for the project setup process.
@@ -30,6 +31,8 @@ type Config struct {
 	CommitAndPushBranchFunc     func(ctx context.Context, cfg *Config, branchName string) error
 	CreatePRFunc                func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error)
 	EnableAutoMergeFunc         func(ctx context.Context, cfg *Config, prURL string) error
+	PollPRStatusFunc            func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error
+	PollInterval                time.Duration
 	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
@@ -525,6 +528,118 @@ func EnableAutoMerge(ctx context.Context, cfg *Config, prURL string) error {
 
 	return nil
 }
+
+// PRCheckItem represents an individual check run or status context from GitHub GraphQL statusCheckRollup.
+type PRCheckItem struct {
+	Typename   string `json:"__typename"`
+	Name       string `json:"name"`
+	Context    string `json:"context"`
+	Status     string `json:"status"`
+	State      string `json:"state"`
+	Conclusion string `json:"conclusion"`
+}
+
+// PRViewStatus represents the JSON payload from gh pr view --json state,statusCheckRollup.
+type PRViewStatus struct {
+	State             string        `json:"state"`
+	StatusCheckRollup []PRCheckItem `json:"statusCheckRollup"`
+}
+
+// PollPRStatus polls the status of a pull request and its CI checks until merged or failure.
+func PollPRStatus(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+	if prURL == "" {
+		return errors.New("prURL cannot be empty")
+	}
+
+	if cfg.PollPRStatusFunc != nil {
+		return cfg.PollPRStatusFunc(ctx, cfg, prURL, timeout)
+	}
+
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	interval := cfg.PollInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+
+	checkOnce := func() (bool, error) {
+		cmd := ghCmd(ctx, cfg, "pr", "view", prURL, "--json", "state,statusCheckRollup")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			return false, fmt.Errorf("gh pr view failed: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+
+		var viewStatus PRViewStatus
+		if err := json.Unmarshal(out, &viewStatus); err != nil {
+			return false, fmt.Errorf("parsing gh pr view JSON: %w", err)
+		}
+
+		// Check for failing status checks immediately
+		for _, check := range viewStatus.StatusCheckRollup {
+			conclusion := strings.ToUpper(check.Conclusion)
+			state := strings.ToUpper(check.State)
+			if conclusion == "FAILURE" || conclusion == "TIMED_OUT" || conclusion == "CANCELLED" || state == "FAILURE" || state == "ERROR" {
+				checkName := check.Name
+				if checkName == "" {
+					checkName = check.Context
+				}
+				if checkName == "" {
+					checkName = "unknown"
+				}
+				reason := check.Conclusion
+				if reason == "" {
+					reason = check.State
+				}
+				return false, fmt.Errorf("status check %q failed with conclusion/state %s", checkName, reason)
+			}
+		}
+
+		// Check overall PR state
+		switch strings.ToUpper(viewStatus.State) {
+		case "MERGED":
+			return true, nil
+		case "CLOSED":
+			return false, fmt.Errorf("pull request %s was closed without merging", prURL)
+		default:
+			return false, nil
+		}
+	}
+
+	// Check immediately before waiting on ticker
+	done, err := checkOnce()
+	if err != nil {
+		return err
+	}
+	if done {
+		return nil
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("polling PR %s timed out: %w", prURL, ctx.Err())
+		case <-ticker.C:
+			done, err := checkOnce()
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+		}
+	}
+}
+
 
 // Run executes the complete speculate project initialization.
 func Run(ctx context.Context, cfg *Config) error {
