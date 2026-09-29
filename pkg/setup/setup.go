@@ -33,6 +33,7 @@ type Config struct {
 	EnableAutoMergeFunc         func(ctx context.Context, cfg *Config, prURL string) error
 	PollPRStatusFunc            func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error
 	PollInterval                time.Duration
+	SyncMainBranchFunc          func(ctx context.Context, cfg *Config, branchName string) error
 	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
@@ -640,6 +641,44 @@ func PollPRStatus(ctx context.Context, cfg *Config, prURL string, timeout time.D
 	}
 }
 
+// SyncMainBranch checks out the main branch, pulls latest changes from origin, and deletes the temporary feature branch.
+func SyncMainBranch(ctx context.Context, cfg *Config, branchName string) error {
+	if branchName == "" {
+		return errors.New("branchName cannot be empty")
+	}
+	if branchName == "main" {
+		return errors.New("cannot clean up main branch")
+	}
+
+	if cfg.SyncMainBranchFunc != nil {
+		return cfg.SyncMainBranchFunc(ctx, cfg, branchName)
+	}
+
+	rootDir := cfg.RootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	// 1. Switch to main: git checkout main
+	checkoutCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "checkout", "main")
+	if out, err := checkoutCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git checkout main failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// 2. Pull remote changes: git pull origin main
+	pullCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "pull", "origin", "main")
+	if out, err := pullCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git pull origin main failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	// 3. Delete temporary local branch: git branch -D <branchName>
+	deleteCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "branch", "-D", branchName)
+	if out, err := deleteCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git branch -D %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
+}
 
 // Run executes the complete speculate project initialization.
 func Run(ctx context.Context, cfg *Config) error {

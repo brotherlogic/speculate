@@ -1008,6 +1008,235 @@ func TestPollPRStatus_CommandFailure(t *testing.T) {
 	}
 }
 
+func TestSyncMainBranch_HookInvocation(t *testing.T) {
+	hookCalled := false
+	var passedBranch string
+	cfg := &Config{
+		SyncMainBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			hookCalled = true
+			passedBranch = branchName
+			return nil
+		},
+	}
+
+	err := SyncMainBranch(context.Background(), cfg, "feature/my-branch")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected SyncMainBranchFunc to be called")
+	}
+	if passedBranch != "feature/my-branch" {
+		t.Errorf("expected branch %q, got %q", "feature/my-branch", passedBranch)
+	}
+}
+
+func TestSyncMainBranch_EmptyBranch(t *testing.T) {
+	cfg := &Config{}
+	err := SyncMainBranch(context.Background(), cfg, "")
+	if err == nil {
+		t.Errorf("expected error when branchName is empty, got nil")
+	}
+}
+
+func TestSyncMainBranch_MainBranch(t *testing.T) {
+	cfg := &Config{}
+	err := SyncMainBranch(context.Background(), cfg, "main")
+	if err == nil {
+		t.Errorf("expected error when branchName is main, got nil")
+	}
+}
+
+func TestSyncMainBranch_Success(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	// Set up a bare remote repository to act as origin
+	bareRemote := t.TempDir()
+	cmdInitBare := exec.Command("git", "init", "--bare")
+	cmdInitBare.Dir = bareRemote
+	if out, err := cmdInitBare.CombinedOutput(); err != nil {
+		t.Fatalf("failed initializing bare remote: %s: %v", string(out), err)
+	}
+	cmdHead := exec.Command("git", "--git-dir", bareRemote, "symbolic-ref", "HEAD", "refs/heads/main")
+	if out, err := cmdHead.CombinedOutput(); err != nil {
+		t.Fatalf("failed setting bare remote HEAD: %s: %v", string(out), err)
+	}
+
+	cmdRemote := exec.Command("git", "remote", "add", "origin", bareRemote)
+	cmdRemote.Dir = tempDir
+	if out, err := cmdRemote.CombinedOutput(); err != nil {
+		t.Fatalf("failed adding remote origin: %s: %v", string(out), err)
+	}
+
+	// Create initial commit on main and push to bare remote
+	initialFile := filepath.Join(tempDir, "README.md")
+	if err := os.WriteFile(initialFile, []byte("# Test"), 0644); err != nil {
+		t.Fatalf("failed writing initial file: %v", err)
+	}
+	cmdAdd := exec.Command("git", "add", "README.md")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+	cmdBranchM := exec.Command("git", "branch", "-M", "main")
+	cmdBranchM.Dir = tempDir
+	if out, err := cmdBranchM.CombinedOutput(); err != nil {
+		t.Fatalf("git branch -M main failed: %s: %v", string(out), err)
+	}
+	cmdPushMain := exec.Command("git", "push", "-u", "origin", "main")
+	cmdPushMain.Dir = tempDir
+	if out, err := cmdPushMain.CombinedOutput(); err != nil {
+		t.Fatalf("git push origin main failed: %s: %v", string(out), err)
+	}
+
+	// Create and checkout feature branch in tempDir
+	featureBranch := "feature/init-scaffolding"
+	cmdCheckoutB := exec.Command("git", "checkout", "-b", featureBranch)
+	cmdCheckoutB.Dir = tempDir
+	if out, err := cmdCheckoutB.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout -b failed: %s: %v", string(out), err)
+	}
+
+	// In another clone, simulate PR merge onto main
+	secondaryClone := t.TempDir()
+	cmdClone := exec.Command("git", "clone", bareRemote, secondaryClone)
+	if out, err := cmdClone.CombinedOutput(); err != nil {
+		t.Fatalf("git clone failed: %s: %v", string(out), err)
+	}
+	_ = exec.Command("git", "-C", secondaryClone, "config", "user.name", "Test User").Run()
+	_ = exec.Command("git", "-C", secondaryClone, "config", "user.email", "test@example.com").Run()
+	mergedFile := filepath.Join(secondaryClone, "merged.txt")
+	if err := os.WriteFile(mergedFile, []byte("merged remote content"), 0644); err != nil {
+		t.Fatalf("writing merged file: %v", err)
+	}
+	cmdAdd2 := exec.Command("git", "add", "merged.txt")
+	cmdAdd2.Dir = secondaryClone
+	_ = cmdAdd2.Run()
+	cmdCommit2 := exec.Command("git", "commit", "-m", "merge pull request #1 into main")
+	cmdCommit2.Dir = secondaryClone
+	_ = cmdCommit2.Run()
+	cmdPush2 := exec.Command("git", "push", "origin", "main")
+	cmdPush2.Dir = secondaryClone
+	if out, err := cmdPush2.CombinedOutput(); err != nil {
+		t.Fatalf("push from secondary clone failed: %s: %v", string(out), err)
+	}
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	// Execute SyncMainBranch
+	if err := SyncMainBranch(context.Background(), cfg, featureBranch); err != nil {
+		t.Fatalf("SyncMainBranch failed unexpectedly: %v", err)
+	}
+
+	// Verify current branch is main
+	cmdBranch := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmdBranch.Dir = tempDir
+	outBranch, err := cmdBranch.Output()
+	if err != nil {
+		t.Fatalf("failed checking current branch: %v", err)
+	}
+	if strings.TrimSpace(string(outBranch)) != "main" {
+		t.Errorf("expected branch main, got %q", strings.TrimSpace(string(outBranch)))
+	}
+
+	// Verify merged.txt was pulled
+	pulledFile := filepath.Join(tempDir, "merged.txt")
+	if _, err := os.Stat(pulledFile); os.IsNotExist(err) {
+		t.Errorf("expected merged.txt to be pulled from origin main, but it does not exist")
+	}
+
+	// Verify feature branch was deleted locally
+	cmdCheckBranch := exec.Command("git", "rev-parse", "--verify", "refs/heads/"+featureBranch)
+	cmdCheckBranch.Dir = tempDir
+	if err := cmdCheckBranch.Run(); err == nil {
+		t.Errorf("expected local feature branch %s to be deleted, but it still exists", featureBranch)
+	}
+}
+
+func TestSyncMainBranch_CheckoutError(t *testing.T) {
+	tempDir := t.TempDir()
+	// Repo not initialized with git, so checkout must fail
+	cfg := &Config{RootDir: tempDir}
+	err := SyncMainBranch(context.Background(), cfg, "feature/foo")
+	if err == nil {
+		t.Errorf("expected error when checkout fails in non-git dir, got nil")
+	}
+}
+
+func TestSyncMainBranch_PullError(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	// Make initial commit on main so checkout main works, but there is no remote
+	initialFile := filepath.Join(tempDir, "README.md")
+	if err := os.WriteFile(initialFile, []byte("# Test"), 0644); err != nil {
+		t.Fatalf("failed writing initial file: %v", err)
+	}
+	cmdAdd := exec.Command("git", "add", "README.md")
+	cmdAdd.Dir = tempDir
+	_ = cmdAdd.Run()
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	_ = cmdCommit.Run()
+	cmdBranchM := exec.Command("git", "branch", "-M", "main")
+	cmdBranchM.Dir = tempDir
+	_ = cmdBranchM.Run()
+
+	cfg := &Config{RootDir: tempDir}
+	// Pull from origin main should fail because origin does not exist
+	err := SyncMainBranch(context.Background(), cfg, "feature/foo")
+	if err == nil {
+		t.Errorf("expected error when pull fails, got nil")
+	}
+}
+
+func TestSyncMainBranch_BranchDeleteError(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	// Set up bare remote
+	bareRemote := t.TempDir()
+	cmdInitBare := exec.Command("git", "init", "--bare")
+	cmdInitBare.Dir = bareRemote
+	_ = cmdInitBare.Run()
+	cmdRemote := exec.Command("git", "remote", "add", "origin", bareRemote)
+	cmdRemote.Dir = tempDir
+	_ = cmdRemote.Run()
+
+	initialFile := filepath.Join(tempDir, "README.md")
+	_ = os.WriteFile(initialFile, []byte("# Test"), 0644)
+	cmdAdd := exec.Command("git", "add", "README.md")
+	cmdAdd.Dir = tempDir
+	_ = cmdAdd.Run()
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	_ = cmdCommit.Run()
+	cmdBranchM2 := exec.Command("git", "branch", "-M", "main")
+	cmdBranchM2.Dir = tempDir
+	_ = cmdBranchM2.Run()
+	cmdPush := exec.Command("git", "push", "-u", "origin", "main")
+	cmdPush.Dir = tempDir
+	_ = cmdPush.Run()
+
+	cfg := &Config{RootDir: tempDir}
+	// Feature branch does not exist, so deleting it should fail
+	err := SyncMainBranch(context.Background(), cfg, "feature/nonexistent-branch")
+	if err == nil {
+		t.Errorf("expected error when deleting nonexistent branch, got nil")
+	}
+}
+
+
 
 
 
