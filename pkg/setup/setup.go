@@ -33,13 +33,13 @@ type Config struct {
 	EnableAutoMergeFunc         func(ctx context.Context, cfg *Config, prURL string) error
 	PollPRStatusFunc            func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error
 	PollInterval                time.Duration
+	PollTimeout                 time.Duration
+	BranchName                  string
 	SyncMainBranchFunc          func(ctx context.Context, cfg *Config, branchName string) error
 	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
-	ConfigureCollabFunc    func(ctx context.Context, cfg *Config) error
-	CommitAndPushFunc      func(ctx context.Context, cfg *Config) error
-	ConfigureRulesetsFunc  func(ctx context.Context, cfg *Config) error
-	CheckExistingRulesetFn func(ctx context.Context, cfg *Config, name string) (int64, string, error)
-	SetRulesetEnforceFn    func(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error
+	ConfigureCollabFunc         func(ctx context.Context, cfg *Config) error
+	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
+	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
 }
 
 // RepoPermissions captures repository access permissions from GitHub API.
@@ -210,6 +210,10 @@ func ghCmd(ctx context.Context, cfg *Config, args ...string) *exec.Cmd {
 
 // CheckPermissions inspects the user's permissions on the target repository.
 func CheckPermissions(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+	if cfg.CheckPermissionsFunc != nil {
+		return cfg.CheckPermissionsFunc(ctx, cfg)
+	}
+
 	cmd := ghCmd(ctx, cfg, "api", fmt.Sprintf("repos/%s", cfg.Repo), "--jq", ".permissions")
 	out, err := cmd.Output()
 	if err != nil {
@@ -224,6 +228,10 @@ func CheckPermissions(ctx context.Context, cfg *Config) (RepoPermissions, error)
 
 // ConfigureRepoSettings enables auto-merge and delete-branch-on-merge.
 func ConfigureRepoSettings(ctx context.Context, cfg *Config) error {
+	if cfg.ConfigureRepoFunc != nil {
+		return cfg.ConfigureRepoFunc(ctx, cfg)
+	}
+
 	cmd := ghCmd(ctx, cfg, "repo", "edit", cfg.Repo, "--enable-auto-merge", "--delete-branch-on-merge")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -234,6 +242,10 @@ func ConfigureRepoSettings(ctx context.Context, cfg *Config) error {
 
 // ConfigureCollaborator adds or verifies collaborator permissions.
 func ConfigureCollaborator(ctx context.Context, cfg *Config) error {
+	if cfg.ConfigureCollabFunc != nil {
+		return cfg.ConfigureCollabFunc(ctx, cfg)
+	}
+
 	if cfg.Collaborator == "" {
 		return nil
 	}
@@ -308,6 +320,10 @@ func SetRulesetEnforcement(ctx context.Context, cfg *Config, rulesetID int64, en
 
 // ConfigureRulesets creates or updates the default branch ruleset.
 func ConfigureRulesets(ctx context.Context, cfg *Config) error {
+	if cfg.ConfigureRulesetsFunc != nil {
+		return cfg.ConfigureRulesetsFunc(ctx, cfg)
+	}
+
 	ruleset := RulesetPayload{
 		Name:        "main",
 		Target:      "branch",
@@ -355,11 +371,7 @@ func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 	}
 
 	// Check if ruleset named "main" already exists
-	checkFn := CheckExistingRuleset
-	if cfg.CheckExistingRulesetFn != nil {
-		checkFn = cfg.CheckExistingRulesetFn
-	}
-	existingID, _, _ := checkFn(ctx, cfg, "main")
+	existingID, _, _ := CheckExistingRuleset(ctx, cfg, "main")
 
 	var applyCmd *exec.Cmd
 	if existingID > 0 {
@@ -379,6 +391,10 @@ func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 
 // CheckScaffoldingChanges stages scaffolding directories and checks if there are pending staged changes.
 func CheckScaffoldingChanges(ctx context.Context, cfg *Config) (bool, error) {
+	if cfg.CheckScaffoldingChangesFunc != nil {
+		return cfg.CheckScaffoldingChangesFunc(ctx, cfg)
+	}
+
 	rootDir := cfg.RootDir
 	if rootDir == "" {
 		rootDir = "."
@@ -447,6 +463,10 @@ func GitCommitAndPush(ctx context.Context, cfg *Config) error {
 
 // GitCommitAndPushBranch creates and switches to a dedicated branch, commits staged files, and pushes the branch to remote origin.
 func GitCommitAndPushBranch(ctx context.Context, cfg *Config, branchName string) error {
+	if cfg.CommitAndPushBranchFunc != nil {
+		return cfg.CommitAndPushBranchFunc(ctx, cfg, branchName)
+	}
+
 	rootDir := cfg.RootDir
 	if rootDir == "" {
 		rootDir = "."
@@ -723,24 +743,15 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	// Check permissions on the target repository
-	checkPerms := CheckPermissions
-	if cfg.CheckPermissionsFunc != nil {
-		checkPerms = cfg.CheckPermissionsFunc
-	}
-	perms, err := checkPerms(ctx, cfg)
+	perms, err := CheckPermissions(ctx, cfg)
 	if err != nil {
 		fmt.Printf("⚠️  Could not determine repository permissions: %v\n", err)
 	}
 
-	var pausedRulesetID int64
 	if perms.Admin {
 		// 3. Repo Settings
 		fmt.Printf("3. Configuring repository settings on GitHub (%s)... ", cfg.Repo)
-		cfgRepo := ConfigureRepoSettings
-		if cfg.ConfigureRepoFunc != nil {
-			cfgRepo = cfg.ConfigureRepoFunc
-		}
-		if err := cfgRepo(ctx, cfg); err != nil {
+		if err := ConfigureRepoSettings(ctx, cfg); err != nil {
 			fmt.Printf("⚠️  Warning: %v\n", err)
 		} else {
 			fmt.Println("✓ Auto-merge & branch deletion enabled")
@@ -749,80 +760,96 @@ func Run(ctx context.Context, cfg *Config) error {
 		// 4. Collaborator
 		if cfg.Collaborator != "" {
 			fmt.Printf("4. Ensuring collaborator access for @%s... ", cfg.Collaborator)
-			cfgCollab := ConfigureCollaborator
-			if cfg.ConfigureCollabFunc != nil {
-				cfgCollab = cfg.ConfigureCollabFunc
-			}
-			if err := cfgCollab(ctx, cfg); err != nil {
+			if err := ConfigureCollaborator(ctx, cfg); err != nil {
 				fmt.Printf("⚠️  Warning: %v\n", err)
 			} else {
 				fmt.Println("✓ Done")
-			}
-		}
-
-		// If a ruleset named "main" already exists and is active, temporarily pause it
-		// during git push so the push is not rejected by GH013.
-		checkRulesFn := CheckExistingRuleset
-		if cfg.CheckExistingRulesetFn != nil {
-			checkRulesFn = cfg.CheckExistingRulesetFn
-		}
-		existingID, enforcement, err := checkRulesFn(ctx, cfg, "main")
-		if err == nil && existingID > 0 && enforcement == "active" {
-			setEnforceFn := SetRulesetEnforcement
-			if cfg.SetRulesetEnforceFn != nil {
-				setEnforceFn = cfg.SetRulesetEnforceFn
-			}
-			if err := setEnforceFn(ctx, cfg, existingID, "disabled"); err == nil {
-				pausedRulesetID = existingID
 			}
 		}
 	} else {
 		fmt.Printf("3-4. Note: Admin permissions required for repository settings and collaborators on %s.\n", cfg.Repo)
 	}
 
-	// Ensure any paused ruleset is restored if an error occurs before ConfigureRulesets
-	if pausedRulesetID > 0 {
-		defer func() {
-			if pausedRulesetID > 0 {
-				setEnforceFn := SetRulesetEnforcement
-				if cfg.SetRulesetEnforceFn != nil {
-					setEnforceFn = cfg.SetRulesetEnforceFn
-				}
-				_ = setEnforceFn(ctx, cfg, pausedRulesetID, "active")
+	// 5. Idempotency Check
+	fmt.Print("5. Checking for scaffolding changes... ")
+	hasChanges, err := CheckScaffoldingChanges(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("checking scaffolding changes: %w", err)
+	}
+	if !hasChanges {
+		fmt.Println("✓ Repository scaffolding is already up to date (no changes detected)")
+		fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)
+		return nil
+	}
+	fmt.Println("✓ Changes detected")
+
+	if cfg.SkipPush {
+		fmt.Println("6. Skipping git branch, push, and PR creation (--skip-push specified)")
+		if perms.Admin {
+			fmt.Print("7. Configuring GitHub Ruleset for default branch... ")
+			if err := ConfigureRulesets(ctx, cfg); err != nil {
+				return fmt.Errorf("failed configuring rulesets: %w", err)
 			}
-		}()
+			fmt.Println("✓ Ruleset 'main' enforced (CODEOWNERS review, required checks, squash merge)")
+		}
+		fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)
+		return nil
 	}
 
-	// 5. Git Push (executed BEFORE ruleset enforcement to prevent GH013 push rejection)
-	if !cfg.SkipPush {
-		fmt.Print("5. Committing and pushing scaffolding changes to remote... ")
-		pushFn := GitCommitAndPush
-		if cfg.CommitAndPushFunc != nil {
-			pushFn = cfg.CommitAndPushFunc
-		}
-		if err := pushFn(ctx, cfg); err != nil {
-			return fmt.Errorf("failed git commit/push: %w", err)
-		}
-		fmt.Println("✓ Pushed to origin")
-	} else {
-		fmt.Println("5. Skipping git push (--skip-push specified)")
+	branchName := cfg.BranchName
+	if branchName == "" {
+		branchName = "feature/speculate-scaffolding"
 	}
 
-	// 6. Ruleset (configured AFTER git push has populated the branch)
+	// 6. Branch creation & push
+	fmt.Printf("6. Creating branch %s and pushing scaffolding changes... ", branchName)
+	if err := GitCommitAndPushBranch(ctx, cfg, branchName); err != nil {
+		return fmt.Errorf("failed committing and pushing branch: %w", err)
+	}
+	fmt.Println("✓ Pushed to origin")
+
+	// 7. PR creation & auto-merge
+	fmt.Printf("7. Creating pull request for %s... ", branchName)
+	prURL, err := CreatePullRequest(ctx, cfg, branchName)
+	if err != nil {
+		return fmt.Errorf("failed creating pull request: %w", err)
+	}
+	fmt.Printf("✓ Created: %s\n", prURL)
+
+	fmt.Print("8. Enabling auto-merge on pull request... ")
+	if err := EnableAutoMerge(ctx, cfg, prURL); err != nil {
+		return fmt.Errorf("failed enabling auto-merge: %w", err)
+	}
+	fmt.Println("✓ Auto-merge enabled")
+
+	// 8. Poll PR status
+	fmt.Printf("9. Polling pull request status until merge (%s)... ", prURL)
+	timeout := cfg.PollTimeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	if err := PollPRStatus(ctx, cfg, prURL, timeout); err != nil {
+		return fmt.Errorf("pull request polling failed: %w", err)
+	}
+	fmt.Println("✓ Pull request merged")
+
+	// 9. Sync main branch
+	fmt.Printf("10. Synchronizing local main branch and cleaning up %s... ", branchName)
+	if err := SyncMainBranch(ctx, cfg, branchName); err != nil {
+		return fmt.Errorf("failed synchronizing main branch: %w", err)
+	}
+	fmt.Println("✓ Local main synchronized and branch cleaned up")
+
+	// 10. Ruleset enforcement
 	if perms.Admin {
-		fmt.Print("6. Configuring GitHub Ruleset for default branch... ")
-		cfgRules := ConfigureRulesets
-		if cfg.ConfigureRulesetsFunc != nil {
-			cfgRules = cfg.ConfigureRulesetsFunc
-		}
-		if err := cfgRules(ctx, cfg); err != nil {
+		fmt.Print("11. Configuring GitHub Ruleset for default branch... ")
+		if err := ConfigureRulesets(ctx, cfg); err != nil {
 			return fmt.Errorf("failed configuring rulesets: %w", err)
 		}
-		pausedRulesetID = 0 // Successfully configured and enforced
 		fmt.Println("✓ Ruleset 'main' enforced (CODEOWNERS review, required checks, squash merge)")
 	} else {
-		fmt.Printf("6. Note: Admin permissions required to configure branch ruleset on %s.\n", cfg.Repo)
-		fmt.Printf("   Current token has push=%v, admin=%v. Run 'speculate init --token=<admin-token>' as repository owner to apply rulesets.\n", perms.Push, perms.Admin)
+		fmt.Printf("11. Note: Admin permissions required to configure branch ruleset on %s.\n", cfg.Repo)
+		fmt.Printf("    Current token has push=%v, admin=%v. Run 'speculate init --token=<admin-token>' as repository owner to apply rulesets.\n", perms.Push, perms.Admin)
 	}
 
 	fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)

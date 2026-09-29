@@ -181,9 +181,10 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 	}
 }
 
-func TestRun_OrderOfOperations_PushBeforeRulesets(t *testing.T) {
+func TestRun_SuccessWithPRWorkflow(t *testing.T) {
 	tempDir := t.TempDir()
 	var executionOrder []string
+	var branchCreated, prCreated, autoMergeEnabled, prPolled, branchSynced string
 
 	cfg := &Config{
 		RootDir:      tempDir,
@@ -191,6 +192,7 @@ func TestRun_OrderOfOperations_PushBeforeRulesets(t *testing.T) {
 		Collaborator: "brotherlogic-automation",
 		Force:        true,
 		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			executionOrder = append(executionOrder, "check_permissions")
 			return RepoPermissions{Admin: true, Push: true}, nil
 		},
 		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
@@ -201,12 +203,37 @@ func TestRun_OrderOfOperations_PushBeforeRulesets(t *testing.T) {
 			executionOrder = append(executionOrder, "collaborator")
 			return nil
 		},
-		CommitAndPushFunc: func(ctx context.Context, cfg *Config) error {
-			executionOrder = append(executionOrder, "git_push")
+		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
+			executionOrder = append(executionOrder, "check_scaffolding")
+			return true, nil
+		},
+		CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			executionOrder = append(executionOrder, "commit_and_push_branch")
+			branchCreated = branchName
+			return nil
+		},
+		CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+			executionOrder = append(executionOrder, "create_pr")
+			prCreated = branchName
+			return "https://github.com/brotherlogic/test-repo/pull/42", nil
+		},
+		EnableAutoMergeFunc: func(ctx context.Context, cfg *Config, prURL string) error {
+			executionOrder = append(executionOrder, "enable_auto_merge")
+			autoMergeEnabled = prURL
+			return nil
+		},
+		PollPRStatusFunc: func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+			executionOrder = append(executionOrder, "poll_pr_status")
+			prPolled = prURL
+			return nil
+		},
+		SyncMainBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			executionOrder = append(executionOrder, "sync_main")
+			branchSynced = branchName
 			return nil
 		},
 		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
-			executionOrder = append(executionOrder, "rulesets")
+			executionOrder = append(executionOrder, "configure_rulesets")
 			return nil
 		},
 	}
@@ -215,34 +242,52 @@ func TestRun_OrderOfOperations_PushBeforeRulesets(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	pushIdx := -1
-	rulesetIdx := -1
-	for idx, op := range executionOrder {
-		if op == "git_push" {
-			pushIdx = idx
-		}
-		if op == "rulesets" {
-			rulesetIdx = idx
+	expectedOrder := []string{
+		"check_permissions",
+		"repo_settings",
+		"collaborator",
+		"check_scaffolding",
+		"commit_and_push_branch",
+		"create_pr",
+		"enable_auto_merge",
+		"poll_pr_status",
+		"sync_main",
+		"configure_rulesets",
+	}
+
+	if len(executionOrder) != len(expectedOrder) {
+		t.Fatalf("expected execution order %v, got %v", expectedOrder, executionOrder)
+	}
+	for i, expected := range expectedOrder {
+		if executionOrder[i] != expected {
+			t.Errorf("expected step %d to be %q, got %q (order: %v)", i, expected, executionOrder[i], executionOrder)
 		}
 	}
 
-	if pushIdx == -1 {
-		t.Fatalf("git_push was not executed in Run")
+	expectedBranch := "feature/speculate-scaffolding"
+	if branchCreated != expectedBranch {
+		t.Errorf("expected branchCreated %q, got %q", expectedBranch, branchCreated)
 	}
-	if rulesetIdx == -1 {
-		t.Fatalf("rulesets was not executed in Run")
+	if prCreated != expectedBranch {
+		t.Errorf("expected prCreated %q, got %q", expectedBranch, prCreated)
+	}
+	if branchSynced != expectedBranch {
+		t.Errorf("expected branchSynced %q, got %q", expectedBranch, branchSynced)
 	}
 
-	// git_push MUST occur before rulesets, otherwise on first push the ruleset
-	// blocks the push with GH013 repository rule violations.
-	if pushIdx > rulesetIdx {
-		t.Fatalf("git_push (index %d) occurred after rulesets (index %d); git_push must occur before rulesets to avoid GH013 push rejection on first push. Order: %v", pushIdx, rulesetIdx, executionOrder)
+	expectedPRURL := "https://github.com/brotherlogic/test-repo/pull/42"
+	if autoMergeEnabled != expectedPRURL {
+		t.Errorf("expected autoMergeEnabled %q, got %q", expectedPRURL, autoMergeEnabled)
+	}
+	if prPolled != expectedPRURL {
+		t.Errorf("expected prPolled %q, got %q", expectedPRURL, prPolled)
 	}
 }
 
-func TestRun_ExistingActiveRuleset_PausedDuringPush(t *testing.T) {
+func TestRun_IdempotentCleanTree_NoOp(t *testing.T) {
 	tempDir := t.TempDir()
-	var events []string
+	branchCreated := false
+	prCreated := false
 
 	cfg := &Config{
 		RootDir:      tempDir,
@@ -258,19 +303,19 @@ func TestRun_ExistingActiveRuleset_PausedDuringPush(t *testing.T) {
 		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
-		CheckExistingRulesetFn: func(ctx context.Context, cfg *Config, name string) (int64, string, error) {
-			return 12345, "active", nil
+		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
+			// Clean tree: no staged changes
+			return false, nil
 		},
-		SetRulesetEnforceFn: func(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error {
-			events = append(events, "enforce_"+enforcement)
+		CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			branchCreated = true
 			return nil
 		},
-		CommitAndPushFunc: func(ctx context.Context, cfg *Config) error {
-			events = append(events, "git_push")
-			return nil
+		CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+			prCreated = true
+			return "https://github.com/brotherlogic/test-repo/pull/42", nil
 		},
 		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
-			events = append(events, "ruleset_configured")
 			return nil
 		},
 	}
@@ -279,20 +324,18 @@ func TestRun_ExistingActiveRuleset_PausedDuringPush(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	expectedOrder := []string{"enforce_disabled", "git_push", "ruleset_configured"}
-	if len(events) != len(expectedOrder) {
-		t.Fatalf("expected events %v, got %v", expectedOrder, events)
+	if branchCreated {
+		t.Errorf("expected no branch creation on clean tree")
 	}
-	for i, exp := range expectedOrder {
-		if events[i] != exp {
-			t.Errorf("expected event[%d] to be %s, got %s (full events: %v)", i, exp, events[i], events)
-		}
+	if prCreated {
+		t.Errorf("expected no PR creation on clean tree")
 	}
 }
 
-func TestRun_ExistingActiveRuleset_RestoredOnPushError(t *testing.T) {
+func TestRun_AbortionOnCICheckFailure(t *testing.T) {
 	tempDir := t.TempDir()
-	var events []string
+	synced := false
+	rulesetConfigured := false
 
 	cfg := &Config{
 		RootDir:      tempDir,
@@ -308,37 +351,102 @@ func TestRun_ExistingActiveRuleset_RestoredOnPushError(t *testing.T) {
 		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
-		CheckExistingRulesetFn: func(ctx context.Context, cfg *Config, name string) (int64, string, error) {
-			return 12345, "active", nil
+		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
+			return true, nil
 		},
-		SetRulesetEnforceFn: func(ctx context.Context, cfg *Config, rulesetID int64, enforcement string) error {
-			events = append(events, "enforce_"+enforcement)
+		CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
 			return nil
 		},
-		CommitAndPushFunc: func(ctx context.Context, cfg *Config) error {
-			events = append(events, "git_push")
-			return errors.New("network failure during push")
+		CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+			return "https://github.com/brotherlogic/test-repo/pull/42", nil
+		},
+		EnableAutoMergeFunc: func(ctx context.Context, cfg *Config, prURL string) error {
+			return nil
+		},
+		PollPRStatusFunc: func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+			return errors.New("status check \"review-gate\" failed with conclusion/state FAILURE")
+		},
+		SyncMainBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			synced = true
+			return nil
 		},
 		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
-			events = append(events, "ruleset_configured")
+			rulesetConfigured = true
 			return nil
 		},
 	}
 
 	err := Run(context.Background(), cfg)
 	if err == nil {
-		t.Fatalf("expected Run to fail on push error, got nil")
+		t.Fatalf("expected Run to fail on CI check failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "review-gate") {
+		t.Errorf("expected error to mention 'review-gate', got: %v", err)
+	}
+	if synced {
+		t.Errorf("SyncMainBranch should not be called when PR polling fails")
+	}
+	if rulesetConfigured {
+		t.Errorf("ConfigureRulesets should not be called when PR polling fails")
+	}
+}
+
+func TestRun_PollingTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	synced := false
+	rulesetConfigured := false
+
+	cfg := &Config{
+		RootDir:      tempDir,
+		Repo:         "brotherlogic/test-repo",
+		Collaborator: "brotherlogic-automation",
+		Force:        true,
+		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			return RepoPermissions{Admin: true, Push: true}, nil
+		},
+		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
+			return true, nil
+		},
+		CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			return nil
+		},
+		CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+			return "https://github.com/brotherlogic/test-repo/pull/42", nil
+		},
+		EnableAutoMergeFunc: func(ctx context.Context, cfg *Config, prURL string) error {
+			return nil
+		},
+		PollPRStatusFunc: func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+			return errors.New("polling PR timed out: context deadline exceeded")
+		},
+		SyncMainBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			synced = true
+			return nil
+		},
+		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
+			rulesetConfigured = true
+			return nil
+		},
 	}
 
-	// Should disable before push, attempt push, then restore to active via defer
-	expectedOrder := []string{"enforce_disabled", "git_push", "enforce_active"}
-	if len(events) != len(expectedOrder) {
-		t.Fatalf("expected events %v, got %v", expectedOrder, events)
+	err := Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected Run to fail on polling timeout, got nil")
 	}
-	for i, exp := range expectedOrder {
-		if events[i] != exp {
-			t.Errorf("expected event[%d] to be %s, got %s (full events: %v)", i, exp, events[i], events)
-		}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected error to mention 'timed out', got: %v", err)
+	}
+	if synced {
+		t.Errorf("SyncMainBranch should not be called when PR polling times out")
+	}
+	if rulesetConfigured {
+		t.Errorf("ConfigureRulesets should not be called when PR polling times out")
 	}
 }
 
