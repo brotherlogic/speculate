@@ -40,6 +40,7 @@ type Config struct {
 	ConfigureCollabFunc         func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
+	CheckToolchainFunc          func(ctx context.Context) error
 }
 
 // RepoPermissions captures repository access permissions from GitHub API.
@@ -95,6 +96,19 @@ func DetectRepo(ctx context.Context, dir string) (string, error) {
 	}
 
 	return "", errors.New("failed to automatically detect GitHub repository; specify via --repo=owner/name")
+}
+
+// CheckToolchain verifies that the go executable is installed and available on PATH.
+func CheckToolchain(ctx context.Context, cfg *Config) error {
+	if cfg != nil && cfg.CheckToolchainFunc != nil {
+		return cfg.CheckToolchainFunc(ctx)
+	}
+
+	if _, err := exec.LookPath("go"); err != nil {
+		return errors.New("go executable not found on PATH; please install Go or verify your PATH environment variable")
+	}
+
+	return nil
 }
 
 // SetupDirectories ensures specs/, proto/, tests/, internal/, and .github/workflows/ exist.
