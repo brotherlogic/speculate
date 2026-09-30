@@ -1344,8 +1344,108 @@ func TestSyncMainBranch_BranchDeleteError(t *testing.T) {
 	}
 }
 
+func TestEnsurePassingTests_ScaffoldsWhenNoTests(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &Config{RootDir: tempDir}
 
+	if err := EnsurePassingTests(cfg); err != nil {
+		t.Fatalf("expected EnsurePassingTests to succeed, got error: %v", err)
+	}
 
+	initTestPath := filepath.Join(tempDir, "tests", "init_test.go")
+	content, err := os.ReadFile(initTestPath)
+	if err != nil {
+		t.Fatalf("expected %s to exist, got error: %v", initTestPath, err)
+	}
 
+	if !strings.Contains(string(content), "func TestInit(t *testing.T)") {
+		t.Errorf("expected init_test.go to contain 'func TestInit(t *testing.T)', got:\n%s", string(content))
+	}
+	if !strings.Contains(string(content), "package tests") {
+		t.Errorf("expected init_test.go to have package tests, got:\n%s", string(content))
+	}
+}
 
+func TestEnsurePassingTests_PreservesExistingTests(t *testing.T) {
+	tempDir := t.TempDir()
+	existingTestDir := filepath.Join(tempDir, "pkg", "mypkg")
+	if err := os.MkdirAll(existingTestDir, 0755); err != nil {
+		t.Fatalf("failed to create existing test dir: %v", err)
+	}
+	existingTestFile := filepath.Join(existingTestDir, "mypkg_test.go")
+	if err := os.WriteFile(existingTestFile, []byte("package mypkg\n"), 0644); err != nil {
+		t.Fatalf("failed to write existing test file: %v", err)
+	}
 
+	cfg := &Config{RootDir: tempDir}
+	if err := EnsurePassingTests(cfg); err != nil {
+		t.Fatalf("expected EnsurePassingTests to succeed, got error: %v", err)
+	}
+
+	initTestPath := filepath.Join(tempDir, "tests", "init_test.go")
+	if _, err := os.Stat(initTestPath); !os.IsNotExist(err) {
+		t.Errorf("expected init_test.go not to be created when existing tests are present")
+	}
+}
+
+func TestHasExistingTests(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Empty dir: should return false
+	hasTests, err := HasExistingTests(tempDir)
+	if err != nil {
+		t.Fatalf("unexpected error checking empty dir: %v", err)
+	}
+	if hasTests {
+		t.Errorf("expected false for empty dir, got true")
+	}
+
+	// 2. Hidden dirs and .git should be ignored
+	gitDir := filepath.Join(tempDir, ".git")
+	_ = os.MkdirAll(gitDir, 0755)
+	_ = os.WriteFile(filepath.Join(gitDir, "ignored_test.go"), []byte("package git\n"), 0644)
+
+	hiddenDir := filepath.Join(tempDir, ".hidden")
+	_ = os.MkdirAll(hiddenDir, 0755)
+	_ = os.WriteFile(filepath.Join(hiddenDir, "ignored_test.go"), []byte("package hidden\n"), 0644)
+
+	hasTests, err = HasExistingTests(tempDir)
+	if err != nil {
+		t.Fatalf("unexpected error checking dir with only hidden tests: %v", err)
+	}
+	if hasTests {
+		t.Errorf("expected false when tests are only in .git or hidden dirs, got true")
+	}
+
+	// 3. Test in normal subdirectory: should return true
+	subDir := filepath.Join(tempDir, "pkg", "sample")
+	_ = os.MkdirAll(subDir, 0755)
+	_ = os.WriteFile(filepath.Join(subDir, "sample_test.go"), []byte("package sample\n"), 0644)
+
+	hasTests, err = HasExistingTests(tempDir)
+	if err != nil {
+		t.Fatalf("unexpected error checking dir with tests: %v", err)
+	}
+	if !hasTests {
+		t.Errorf("expected true when tests are present, got false")
+	}
+}
+
+func TestEnsurePassingTests_HookInvocation(t *testing.T) {
+	hookCalled := false
+	expectedErr := errors.New("hook error")
+	cfg := &Config{
+		EnsurePassingTestsFunc: func(cfg *Config) error {
+			hookCalled = true
+			return expectedErr
+		},
+	}
+
+	err := EnsurePassingTests(cfg)
+	if !hookCalled {
+		t.Fatalf("expected EnsurePassingTestsFunc hook to be called")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
+	}
+}
