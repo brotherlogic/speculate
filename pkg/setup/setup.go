@@ -43,6 +43,7 @@ type Config struct {
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
 	CheckToolchainFunc          func(ctx context.Context) error
 	EnsurePassingTestsFunc      func(cfg *Config) error
+	VerifyLocalTestsFunc        func(ctx context.Context, cfg *Config) error
 }
 
 // RepoPermissions captures repository access permissions from GitHub API.
@@ -506,6 +507,31 @@ func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 	out, err := applyCmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("applying ruleset via gh: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
+}
+
+// VerifyLocalTests executes 'go test ./...' inside cfg.RootDir to verify tests compile and pass.
+func VerifyLocalTests(ctx context.Context, cfg *Config) error {
+	if cfg.VerifyLocalTestsFunc != nil {
+		return cfg.VerifyLocalTestsFunc(ctx, cfg)
+	}
+
+	rootDir := cfg.RootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	cmd := exec.CommandContext(ctx, "go", "test", "./...")
+	cmd.Dir = rootDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		outputStr := strings.TrimSpace(string(out))
+		if outputStr != "" {
+			return fmt.Errorf("local test verification failed:\n%s: %w", outputStr, err)
+		}
+		return fmt.Errorf("local test verification failed: %w", err)
 	}
 
 	return nil
