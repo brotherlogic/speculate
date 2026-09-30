@@ -1344,6 +1344,145 @@ func TestSyncMainBranch_BranchDeleteError(t *testing.T) {
 	}
 }
 
+func TestCheckToolchain_Success(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test using hook
+	hookCalled := false
+	cfgWithHook := &Config{
+		CheckToolchainFunc: func(ctx context.Context) error {
+			hookCalled = true
+			return nil
+		},
+	}
+	if err := CheckToolchain(ctx, cfgWithHook); err != nil {
+		t.Fatalf("unexpected error with hook: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected hook to be called")
+	}
+
+	// 2. Test using standard PATH (since go is installed in this test environment)
+	cfgDefault := &Config{}
+	if err := CheckToolchain(ctx, cfgDefault); err != nil {
+		t.Fatalf("unexpected error with default PATH: %v", err)
+	}
+}
+
+func TestCheckToolchain_Missing(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test hook returning error
+	expectedErr := errors.New("custom toolchain error")
+	cfgWithHook := &Config{
+		CheckToolchainFunc: func(ctx context.Context) error {
+			return expectedErr
+		},
+	}
+	if err := CheckToolchain(ctx, cfgWithHook); !errors.Is(err, expectedErr) {
+		t.Errorf("expected error %v, got %v", expectedErr, err)
+	}
+
+	// 2. Test empty PATH
+	t.Setenv("PATH", t.TempDir()) // Empty directory with no go binary
+	cfgDefault := &Config{}
+	err := CheckToolchain(ctx, cfgDefault)
+	if err == nil {
+		t.Fatalf("expected error when go is not on PATH, got nil")
+	}
+	expectedMsg := "go executable not found on PATH; please install Go or verify your PATH environment variable"
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("expected error message to contain %q, got %q", expectedMsg, err.Error())
+	}
+}
+
+func TestEnsureGoModule_AbsentInitializesModule(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("EnsureGoModule failed: %v", err)
+	}
+
+	goModPath := filepath.Join(tempDir, "go.mod")
+	content, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("expected go.mod to be created: %v", err)
+	}
+
+	if !strings.Contains(string(content), "module github.com/brotherlogic/test-repo") {
+		t.Errorf("expected go.mod to contain module path github.com/brotherlogic/test-repo, got:\n%s", string(content))
+	}
+}
+
+func TestEnsureGoModule_PreservesExistingModule(t *testing.T) {
+	tempDir := t.TempDir()
+	existingContent := "module custom.domain/existing/pkg\n\ngo 1.22\n"
+	goModPath := filepath.Join(tempDir, "go.mod")
+	if err := os.WriteFile(goModPath, []byte(existingContent), 0644); err != nil {
+		t.Fatalf("failed to write initial go.mod: %v", err)
+	}
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("EnsureGoModule returned unexpected error on existing module: %v", err)
+	}
+
+	content, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("failed to read go.mod: %v", err)
+	}
+
+	if string(content) != existingContent {
+		t.Errorf("expected go.mod content to be preserved as %q, got %q", existingContent, string(content))
+	}
+}
+
+func TestEnsureGoModule_HookInvocation(t *testing.T) {
+	tempDir := t.TempDir()
+	var invokedPath string
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		InitGoModuleFunc: func(ctx context.Context, c *Config, modulePath string) error {
+			invokedPath = modulePath
+			return nil
+		},
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("EnsureGoModule failed: %v", err)
+	}
+
+	expectedPath := "github.com/brotherlogic/test-repo"
+	if invokedPath != expectedPath {
+		t.Errorf("expected hook to be called with module path %q, got %q", expectedPath, invokedPath)
+	}
+}
+
+func TestEnsureGoModule_ExecutionError(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/invalid module name with spaces",
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err == nil {
+		t.Errorf("expected error when initializing module with invalid path, got nil")
+	}
+}
+
 func TestEnsurePassingTests_ScaffoldsWhenNoTests(t *testing.T) {
 	tempDir := t.TempDir()
 	cfg := &Config{RootDir: tempDir}

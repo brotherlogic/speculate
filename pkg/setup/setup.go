@@ -26,6 +26,7 @@ type Config struct {
 	PromptFunc   func(path string) bool
 
 	// Testing hooks
+	InitGoModuleFunc            func(ctx context.Context, cfg *Config, modulePath string) error
 	CheckPermissionsFunc        func(ctx context.Context, cfg *Config) (RepoPermissions, error)
 	CheckScaffoldingChangesFunc func(ctx context.Context, cfg *Config) (bool, error)
 	CommitAndPushBranchFunc     func(ctx context.Context, cfg *Config, branchName string) error
@@ -40,6 +41,7 @@ type Config struct {
 	ConfigureCollabFunc         func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
+	CheckToolchainFunc          func(ctx context.Context) error
 	EnsurePassingTestsFunc      func(cfg *Config) error
 }
 
@@ -96,6 +98,19 @@ func DetectRepo(ctx context.Context, dir string) (string, error) {
 	}
 
 	return "", errors.New("failed to automatically detect GitHub repository; specify via --repo=owner/name")
+}
+
+// CheckToolchain verifies that the go executable is installed and available on PATH.
+func CheckToolchain(ctx context.Context, cfg *Config) error {
+	if cfg != nil && cfg.CheckToolchainFunc != nil {
+		return cfg.CheckToolchainFunc(ctx)
+	}
+
+	if _, err := exec.LookPath("go"); err != nil {
+		return errors.New("go executable not found on PATH; please install Go or verify your PATH environment variable")
+	}
+
+	return nil
 }
 
 // SetupDirectories ensures specs/, proto/, tests/, internal/, and .github/workflows/ exist.
@@ -262,6 +277,47 @@ func defaultPrompt(path string) bool {
 	_, _ = fmt.Scanln(&resp)
 	resp = strings.TrimSpace(resp)
 	return strings.EqualFold(resp, "y") || strings.EqualFold(resp, "yes")
+}
+
+// EnsureGoModule checks for go.mod in cfg.RootDir and initializes it if absent.
+func EnsureGoModule(ctx context.Context, cfg *Config) error {
+	goModPath := filepath.Join(cfg.RootDir, "go.mod")
+	if _, err := os.Stat(goModPath); err == nil {
+		log.Printf("go.mod already exists in %s, skipping initialization", cfg.RootDir)
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking for go.mod: %w", err)
+	}
+
+	modulePath := cfg.Repo
+	if modulePath == "" && cfg.RootDir != "" {
+		if detected, err := DetectRepo(ctx, cfg.RootDir); err == nil && detected != "" {
+			modulePath = detected
+		}
+	}
+	if modulePath == "" {
+		return errors.New("cannot determine module path: repository not configured")
+	}
+
+	if !strings.HasPrefix(modulePath, "github.com/") {
+		if cfg.Owner != "" && !strings.Contains(modulePath, "/") {
+			modulePath = fmt.Sprintf("github.com/%s/%s", cfg.Owner, modulePath)
+		} else {
+			modulePath = fmt.Sprintf("github.com/%s", strings.TrimPrefix(modulePath, "/"))
+		}
+	}
+
+	if cfg.InitGoModuleFunc != nil {
+		return cfg.InitGoModuleFunc(ctx, cfg, modulePath)
+	}
+
+	cmd := exec.CommandContext(ctx, "go", "mod", "init", modulePath)
+	cmd.Dir = cfg.RootDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("go mod init failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	return nil
 }
 
 // ghCmd executes a gh command with token in environment if configured.
