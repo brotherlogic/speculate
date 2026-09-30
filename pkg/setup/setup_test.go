@@ -1344,6 +1344,58 @@ func TestSyncMainBranch_BranchDeleteError(t *testing.T) {
 	}
 }
 
+func TestCheckToolchain_Success(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test using hook
+	hookCalled := false
+	cfgWithHook := &Config{
+		CheckToolchainFunc: func(ctx context.Context) error {
+			hookCalled = true
+			return nil
+		},
+	}
+	if err := CheckToolchain(ctx, cfgWithHook); err != nil {
+		t.Fatalf("unexpected error with hook: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected hook to be called")
+	}
+
+	// 2. Test using standard PATH (since go is installed in this test environment)
+	cfgDefault := &Config{}
+	if err := CheckToolchain(ctx, cfgDefault); err != nil {
+		t.Fatalf("unexpected error with default PATH: %v", err)
+	}
+}
+
+func TestCheckToolchain_Missing(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test hook returning error
+	expectedErr := errors.New("custom toolchain error")
+	cfgWithHook := &Config{
+		CheckToolchainFunc: func(ctx context.Context) error {
+			return expectedErr
+		},
+	}
+	if err := CheckToolchain(ctx, cfgWithHook); !errors.Is(err, expectedErr) {
+		t.Errorf("expected error %v, got %v", expectedErr, err)
+	}
+
+	// 2. Test empty PATH
+	t.Setenv("PATH", t.TempDir()) // Empty directory with no go binary
+	cfgDefault := &Config{}
+	err := CheckToolchain(ctx, cfgDefault)
+	if err == nil {
+		t.Fatalf("expected error when go is not on PATH, got nil")
+	}
+	expectedMsg := "go executable not found on PATH; please install Go or verify your PATH environment variable"
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("expected error message to contain %q, got %q", expectedMsg, err.Error())
+	}
+}
+
 func TestEnsureGoModule_AbsentInitializesModule(t *testing.T) {
 	tempDir := t.TempDir()
 	cfg := &Config{
@@ -1430,8 +1482,6 @@ func TestEnsureGoModule_ExecutionError(t *testing.T) {
 		t.Errorf("expected error when initializing module with invalid path, got nil")
 	}
 }
-
-
 
 
 
