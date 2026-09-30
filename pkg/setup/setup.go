@@ -42,6 +42,7 @@ type Config struct {
 	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
 	CheckToolchainFunc          func(ctx context.Context) error
+	EnsureGoModuleFunc          func(ctx context.Context, cfg *Config) error
 	EnsurePassingTestsFunc      func(cfg *Config) error
 	VerifyLocalTestsFunc        func(ctx context.Context, cfg *Config) error
 }
@@ -282,6 +283,10 @@ func defaultPrompt(path string) bool {
 
 // EnsureGoModule checks for go.mod in cfg.RootDir and initializes it if absent.
 func EnsureGoModule(ctx context.Context, cfg *Config) error {
+	if cfg != nil && cfg.EnsureGoModuleFunc != nil {
+		return cfg.EnsureGoModuleFunc(ctx, cfg)
+	}
+
 	goModPath := filepath.Join(cfg.RootDir, "go.mod")
 	if _, err := os.Stat(goModPath); err == nil {
 		log.Printf("go.mod already exists in %s, skipping initialization", cfg.RootDir)
@@ -549,7 +554,7 @@ func CheckScaffoldingChanges(ctx context.Context, cfg *Config) (bool, error) {
 	}
 
 	// 1. Stage scaffolding paths
-	paths := []string{".github", "specs", "proto", "tests", "internal"}
+	paths := []string{".github", "specs", "proto", "tests", "internal", "go.mod", "go.sum"}
 	var existingPaths []string
 	for _, p := range paths {
 		if _, err := os.Stat(filepath.Join(rootDir, p)); err == nil {
@@ -581,27 +586,43 @@ func CheckScaffoldingChanges(ctx context.Context, cfg *Config) (bool, error) {
 
 // GitCommitAndPush stages changes, commits, and performs a single push to remote.
 func GitCommitAndPush(ctx context.Context, cfg *Config) error {
-	// 1. Stage directories
-	addCmd := exec.CommandContext(ctx, "git", "-C", cfg.RootDir, "add", ".github", "specs", "proto", "tests", "internal")
-	if out, err := addCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git add failed: %s: %w", strings.TrimSpace(string(out)), err)
+	rootDir := cfg.RootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	// 1. Stage scaffolding paths (including go.mod and go.sum if present)
+	paths := []string{".github", "specs", "proto", "tests", "internal", "go.mod", "go.sum"}
+	var existingPaths []string
+	for _, p := range paths {
+		if _, err := os.Stat(filepath.Join(rootDir, p)); err == nil {
+			existingPaths = append(existingPaths, p)
+		}
+	}
+
+	if len(existingPaths) > 0 {
+		args := append([]string{"-C", rootDir, "add"}, existingPaths...)
+		addCmd := exec.CommandContext(ctx, "git", args...)
+		if out, err := addCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git add failed: %s: %w", strings.TrimSpace(string(out)), err)
+		}
 	}
 
 	// 2. Check if anything is staged
-	diffCmd := exec.CommandContext(ctx, "git", "-C", cfg.RootDir, "diff", "--cached", "--quiet")
+	diffCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "diff", "--cached", "--quiet")
 	if err := diffCmd.Run(); err == nil {
 		log.Println("Working tree has no new changes to commit.")
 		return nil
 	}
 
 	// 3. Commit
-	commitCmd := exec.CommandContext(ctx, "git", "-C", cfg.RootDir, "commit", "-m", "chore: initialize speculate project scaffolding")
+	commitCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "commit", "-m", "chore: initialize speculate project scaffolding")
 	if out, err := commitCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git commit failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
 	// 4. Single push to origin HEAD
-	pushCmd := exec.CommandContext(ctx, "git", "-C", cfg.RootDir, "push", "origin", "HEAD")
+	pushCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "push", "origin", "HEAD")
 	if out, err := pushCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git push failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -871,15 +892,22 @@ func Run(ctx context.Context, cfg *Config) error {
 	fmt.Printf("🚀 Initializing Speculate setup for repository: %s\n", cfg.Repo)
 	fmt.Printf("📁 Target directory: %s\n\n", cfg.RootDir)
 
-	// 1. Directories
-	fmt.Print("1. Setting up directory structure (specs/, proto/, tests/, internal/)... ")
+	// 1. Toolchain Check
+	fmt.Print("1. Checking Go toolchain availability... ")
+	if err := CheckToolchain(ctx, cfg); err != nil {
+		return fmt.Errorf("toolchain check failed: %w", err)
+	}
+	fmt.Println("✓ Done")
+
+	// 2. Directories
+	fmt.Print("2. Setting up directory structure (specs/, proto/, tests/, internal/)... ")
 	if err := SetupDirectories(cfg); err != nil {
 		return fmt.Errorf("failed creating directories: %w", err)
 	}
 	fmt.Println("✓ Done")
 
-	// 2. Templates
-	fmt.Print("2. Setting up workflows and CODEOWNERS... ")
+	// 3. Templates
+	fmt.Print("3. Setting up workflows and CODEOWNERS... ")
 	written, err := SetupTemplateFiles(cfg)
 	if err != nil {
 		return fmt.Errorf("failed creating template files: %w", err)
@@ -890,24 +918,43 @@ func Run(ctx context.Context, cfg *Config) error {
 		fmt.Println("✓ Up-to-date (no changes needed)")
 	}
 
-	// Check permissions on the target repository
+	// 4. Go Module
+	fmt.Print("4. Ensuring Go module initialization (go.mod)... ")
+	if err := EnsureGoModule(ctx, cfg); err != nil {
+		return fmt.Errorf("failed ensuring Go module: %w", err)
+	}
+	fmt.Println("✓ Done")
+
+	// 5. Passing Tests
+	fmt.Print("5. Ensuring initial passing test suite (tests/init_test.go)... ")
+	if err := EnsurePassingTests(cfg); err != nil {
+		return fmt.Errorf("failed ensuring passing tests: %w", err)
+	}
+	fmt.Println("✓ Done")
+
+	// 6. Verify Local Tests
+	fmt.Print("6. Verifying local test suite (go test ./...)... ")
+	if err := VerifyLocalTests(ctx, cfg); err != nil {
+		return fmt.Errorf("local test verification failed: %w", err)
+	}
+	fmt.Println("✓ Passed")
+
+	// 7. Check permissions and repository settings on GitHub
 	perms, err := CheckPermissions(ctx, cfg)
 	if err != nil {
 		fmt.Printf("⚠️  Could not determine repository permissions: %v\n", err)
 	}
 
 	if perms.Admin {
-		// 3. Repo Settings
-		fmt.Printf("3. Configuring repository settings on GitHub (%s)... ", cfg.Repo)
+		fmt.Printf("7a. Configuring repository settings on GitHub (%s)... ", cfg.Repo)
 		if err := ConfigureRepoSettings(ctx, cfg); err != nil {
 			fmt.Printf("⚠️  Warning: %v\n", err)
 		} else {
 			fmt.Println("✓ Auto-merge & branch deletion enabled")
 		}
 
-		// 4. Collaborator
 		if cfg.Collaborator != "" {
-			fmt.Printf("4. Ensuring collaborator access for @%s... ", cfg.Collaborator)
+			fmt.Printf("7b. Ensuring collaborator access for @%s... ", cfg.Collaborator)
 			if err := ConfigureCollaborator(ctx, cfg); err != nil {
 				fmt.Printf("⚠️  Warning: %v\n", err)
 			} else {
@@ -915,11 +962,11 @@ func Run(ctx context.Context, cfg *Config) error {
 			}
 		}
 	} else {
-		fmt.Printf("3-4. Note: Admin permissions required for repository settings and collaborators on %s.\n", cfg.Repo)
+		fmt.Printf("7. Note: Admin permissions required for repository settings and collaborators on %s.\n", cfg.Repo)
 	}
 
-	// 5. Idempotency Check
-	fmt.Print("5. Checking for scaffolding changes... ")
+	// 8. Idempotency Check
+	fmt.Print("8. Checking for scaffolding changes... ")
 	hasChanges, err := CheckScaffoldingChanges(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("checking scaffolding changes: %w", err)
@@ -932,9 +979,9 @@ func Run(ctx context.Context, cfg *Config) error {
 	fmt.Println("✓ Changes detected")
 
 	if cfg.SkipPush {
-		fmt.Println("6. Skipping git branch, push, and PR creation (--skip-push specified)")
+		fmt.Println("9. Skipping git branch, push, and PR creation (--skip-push specified)")
 		if perms.Admin {
-			fmt.Print("7. Configuring GitHub Ruleset for default branch... ")
+			fmt.Print("10. Configuring GitHub Ruleset for default branch... ")
 			if err := ConfigureRulesets(ctx, cfg); err != nil {
 				return fmt.Errorf("failed configuring rulesets: %w", err)
 			}
@@ -949,29 +996,29 @@ func Run(ctx context.Context, cfg *Config) error {
 		branchName = "feature/speculate-scaffolding"
 	}
 
-	// 6. Branch creation & push
-	fmt.Printf("6. Creating branch %s and pushing scaffolding changes... ", branchName)
+	// 9. Branch creation & push
+	fmt.Printf("9. Creating branch %s and pushing scaffolding changes... ", branchName)
 	if err := GitCommitAndPushBranch(ctx, cfg, branchName); err != nil {
 		return fmt.Errorf("failed committing and pushing branch: %w", err)
 	}
 	fmt.Println("✓ Pushed to origin")
 
-	// 7. PR creation & auto-merge
-	fmt.Printf("7. Creating pull request for %s... ", branchName)
+	// 10. PR creation & auto-merge
+	fmt.Printf("10. Creating pull request for %s... ", branchName)
 	prURL, err := CreatePullRequest(ctx, cfg, branchName)
 	if err != nil {
 		return fmt.Errorf("failed creating pull request: %w", err)
 	}
 	fmt.Printf("✓ Created: %s\n", prURL)
 
-	fmt.Print("8. Enabling auto-merge on pull request... ")
+	fmt.Print("11. Enabling auto-merge on pull request... ")
 	if err := EnableAutoMerge(ctx, cfg, prURL); err != nil {
 		return fmt.Errorf("failed enabling auto-merge: %w", err)
 	}
 	fmt.Println("✓ Auto-merge enabled")
 
-	// 8. Poll PR status
-	fmt.Printf("9. Polling pull request status until merge (%s)... ", prURL)
+	// 12. Poll PR status
+	fmt.Printf("12. Polling pull request status until merge (%s)... ", prURL)
 	timeout := cfg.PollTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -981,22 +1028,22 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 	fmt.Println("✓ Pull request merged")
 
-	// 9. Sync main branch
-	fmt.Printf("10. Synchronizing local main branch and cleaning up %s... ", branchName)
+	// 13. Sync main branch
+	fmt.Printf("13. Synchronizing local main branch and cleaning up %s... ", branchName)
 	if err := SyncMainBranch(ctx, cfg, branchName); err != nil {
 		return fmt.Errorf("failed synchronizing main branch: %w", err)
 	}
 	fmt.Println("✓ Local main synchronized and branch cleaned up")
 
-	// 10. Ruleset enforcement
+	// 14. Ruleset enforcement
 	if perms.Admin {
-		fmt.Print("11. Configuring GitHub Ruleset for default branch... ")
+		fmt.Print("14. Configuring GitHub Ruleset for default branch... ")
 		if err := ConfigureRulesets(ctx, cfg); err != nil {
 			return fmt.Errorf("failed configuring rulesets: %w", err)
 		}
 		fmt.Println("✓ Ruleset 'main' enforced (CODEOWNERS review, required checks, squash merge)")
 	} else {
-		fmt.Printf("11. Note: Admin permissions required to configure branch ruleset on %s.\n", cfg.Repo)
+		fmt.Printf("14. Note: Admin permissions required to configure branch ruleset on %s.\n", cfg.Repo)
 		fmt.Printf("    Current token has push=%v, admin=%v. Run 'speculate init --token=<admin-token>' as repository owner to apply rulesets.\n", perms.Push, perms.Admin)
 	}
 

@@ -450,6 +450,105 @@ func TestRun_PollingTimeout(t *testing.T) {
 	}
 }
 
+func TestRun_FullScaffoldingE2E(t *testing.T) {
+	tempDir := t.TempDir()
+	var executionOrder []string
+
+	cfg := &Config{
+		RootDir:      tempDir,
+		Repo:         "brotherlogic/test-repo",
+		Collaborator: "brotherlogic-automation",
+		Force:        true,
+		CheckToolchainFunc: func(ctx context.Context) error {
+			executionOrder = append(executionOrder, "check_toolchain")
+			return nil
+		},
+		InitGoModuleFunc: func(ctx context.Context, cfg *Config, modulePath string) error {
+			executionOrder = append(executionOrder, "ensure_go_module")
+			return nil
+		},
+		EnsurePassingTestsFunc: func(cfg *Config) error {
+			executionOrder = append(executionOrder, "ensure_passing_tests")
+			return nil
+		},
+		VerifyLocalTestsFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "verify_local_tests")
+			return nil
+		},
+		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			executionOrder = append(executionOrder, "check_permissions")
+			return RepoPermissions{Admin: true, Push: true}, nil
+		},
+		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "repo_settings")
+			return nil
+		},
+		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "collaborator")
+			return nil
+		},
+		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
+			executionOrder = append(executionOrder, "check_scaffolding")
+			return true, nil
+		},
+		CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			executionOrder = append(executionOrder, "commit_and_push_branch")
+			return nil
+		},
+		CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+			executionOrder = append(executionOrder, "create_pr")
+			return "https://github.com/brotherlogic/test-repo/pull/42", nil
+		},
+		EnableAutoMergeFunc: func(ctx context.Context, cfg *Config, prURL string) error {
+			executionOrder = append(executionOrder, "enable_auto_merge")
+			return nil
+		},
+		PollPRStatusFunc: func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+			executionOrder = append(executionOrder, "poll_pr_status")
+			return nil
+		},
+		SyncMainBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			executionOrder = append(executionOrder, "sync_main")
+			return nil
+		},
+		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "configure_rulesets")
+			return nil
+		},
+	}
+
+	if err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	expectedOrder := []string{
+		"check_toolchain",
+		"ensure_go_module",
+		"ensure_passing_tests",
+		"verify_local_tests",
+		"check_permissions",
+		"repo_settings",
+		"collaborator",
+		"check_scaffolding",
+		"commit_and_push_branch",
+		"create_pr",
+		"enable_auto_merge",
+		"poll_pr_status",
+		"sync_main",
+		"configure_rulesets",
+	}
+
+	if len(executionOrder) != len(expectedOrder) {
+		t.Fatalf("expected execution order %v, got %v", expectedOrder, executionOrder)
+	}
+	for i, expected := range expectedOrder {
+		if executionOrder[i] != expected {
+			t.Errorf("expected step %d to be %q, got %q (order: %v)", i, expected, executionOrder[i], executionOrder)
+		}
+	}
+}
+
+
 func initGitRepo(t *testing.T, dir string) {
 	t.Helper()
 	cmds := [][]string{
@@ -591,6 +690,63 @@ func TestCheckScaffoldingChanges_IgnoresNonScaffolding(t *testing.T) {
 		t.Errorf("expected CheckScaffoldingChanges to return false when only non-scaffolding changes exist, got true")
 	}
 }
+
+func TestCheckScaffoldingChanges_StagesGoModAndSum(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	if err := SetupDirectories(cfg); err != nil {
+		t.Fatalf("SetupDirectories failed: %v", err)
+	}
+	if _, err := SetupTemplateFiles(cfg); err != nil {
+		t.Fatalf("SetupTemplateFiles failed: %v", err)
+	}
+
+	// Commit initial scaffolding
+	cmdAdd := exec.Command("git", "add", ".")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+
+	// Verify tree is clean first
+	hasChanges, err := CheckScaffoldingChanges(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("CheckScaffoldingChanges failed: %v", err)
+	}
+	if hasChanges {
+		t.Fatalf("expected clean tree initially")
+	}
+
+	// Add go.mod and go.sum
+	if err := os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte("module github.com/brotherlogic/test-repo\n\ngo 1.25\n"), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, "go.sum"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write go.sum: %v", err)
+	}
+
+	// CheckScaffoldingChanges should now detect go.mod and go.sum
+	hasChanges, err = CheckScaffoldingChanges(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("CheckScaffoldingChanges returned unexpected error: %v", err)
+	}
+	if !hasChanges {
+		t.Errorf("expected CheckScaffoldingChanges to detect changes when go.mod and go.sum are present, got false")
+	}
+}
+
 
 func TestConfig_CheckScaffoldingChangesHook(t *testing.T) {
 	hookCalled := false
