@@ -1344,6 +1344,94 @@ func TestSyncMainBranch_BranchDeleteError(t *testing.T) {
 	}
 }
 
+func TestEnsureGoModule_AbsentInitializesModule(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("EnsureGoModule failed: %v", err)
+	}
+
+	goModPath := filepath.Join(tempDir, "go.mod")
+	content, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("expected go.mod to be created: %v", err)
+	}
+
+	if !strings.Contains(string(content), "module github.com/brotherlogic/test-repo") {
+		t.Errorf("expected go.mod to contain module path github.com/brotherlogic/test-repo, got:\n%s", string(content))
+	}
+}
+
+func TestEnsureGoModule_PreservesExistingModule(t *testing.T) {
+	tempDir := t.TempDir()
+	existingContent := "module custom.domain/existing/pkg\n\ngo 1.22\n"
+	goModPath := filepath.Join(tempDir, "go.mod")
+	if err := os.WriteFile(goModPath, []byte(existingContent), 0644); err != nil {
+		t.Fatalf("failed to write initial go.mod: %v", err)
+	}
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("EnsureGoModule returned unexpected error on existing module: %v", err)
+	}
+
+	content, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("failed to read go.mod: %v", err)
+	}
+
+	if string(content) != existingContent {
+		t.Errorf("expected go.mod content to be preserved as %q, got %q", existingContent, string(content))
+	}
+}
+
+func TestEnsureGoModule_HookInvocation(t *testing.T) {
+	tempDir := t.TempDir()
+	var invokedPath string
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		InitGoModuleFunc: func(ctx context.Context, c *Config, modulePath string) error {
+			invokedPath = modulePath
+			return nil
+		},
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("EnsureGoModule failed: %v", err)
+	}
+
+	expectedPath := "github.com/brotherlogic/test-repo"
+	if invokedPath != expectedPath {
+		t.Errorf("expected hook to be called with module path %q, got %q", expectedPath, invokedPath)
+	}
+}
+
+func TestEnsureGoModule_ExecutionError(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/invalid module name with spaces",
+	}
+
+	err := EnsureGoModule(context.Background(), cfg)
+	if err == nil {
+		t.Errorf("expected error when initializing module with invalid path, got nil")
+	}
+}
+
+
 
 
 
