@@ -1344,8 +1344,71 @@ func TestSyncMainBranch_BranchDeleteError(t *testing.T) {
 	}
 }
 
+func TestVerifyLocalTests_Success(t *testing.T) {
+	tempDir := t.TempDir()
+	goMod := "module example.com/testmod\n\ngo 1.25\n"
+	if err := os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	testContent := `package testmod
 
+import "testing"
 
+func TestSample(t *testing.T) {
+}
+`
+	if err := os.WriteFile(filepath.Join(tempDir, "sample_test.go"), []byte(testContent), 0644); err != nil {
+		t.Fatalf("failed to write sample_test.go: %v", err)
+	}
 
+	cfg := &Config{RootDir: tempDir}
+	if err := VerifyLocalTests(context.Background(), cfg); err != nil {
+		t.Fatalf("expected VerifyLocalTests to succeed, got error: %v", err)
+	}
+}
 
+func TestVerifyLocalTests_FailsOnBrokenCode(t *testing.T) {
+	tempDir := t.TempDir()
+	goMod := "module example.com/brokenmod\n\ngo 1.25\n"
+	if err := os.WriteFile(filepath.Join(tempDir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatalf("failed to write go.mod: %v", err)
+	}
+	testContent := `package brokenmod
 
+import "testing"
+
+func TestBroken(t *testing.T) {
+	t.Fatal("deliberate test failure")
+}
+`
+	if err := os.WriteFile(filepath.Join(tempDir, "sample_test.go"), []byte(testContent), 0644); err != nil {
+		t.Fatalf("failed to write sample_test.go: %v", err)
+	}
+
+	cfg := &Config{RootDir: tempDir}
+	err := VerifyLocalTests(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected VerifyLocalTests to fail on broken test, got nil")
+	}
+	if !strings.Contains(err.Error(), "deliberate test failure") {
+		t.Errorf("expected error message to contain test output 'deliberate test failure', got: %v", err)
+	}
+}
+
+func TestVerifyLocalTests_HookInvocation(t *testing.T) {
+	hookCalled := false
+	expectedErr := errors.New("hook error")
+	cfg := &Config{
+		VerifyLocalTestsFunc: func(ctx context.Context, cfg *Config) error {
+			hookCalled = true
+			return expectedErr
+		},
+	}
+	err := VerifyLocalTests(context.Background(), cfg)
+	if !hookCalled {
+		t.Fatalf("expected VerifyLocalTestsFunc hook to be called")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
+	}
+}
