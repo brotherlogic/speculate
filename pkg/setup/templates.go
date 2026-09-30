@@ -189,6 +189,15 @@ jobs:
         run: go vet ./...
 `
 
+const initTestTemplate = `package tests
+
+import "testing"
+
+func TestInit(t *testing.T) {
+	t.Log("Speculate repository initialization test passed")
+}
+`
+
 func renderTemplate(tmplStr string, ctx TemplateContext) (string, error) {
 	tmpl, err := template.New("tmpl").Delims("[[", "]]").Parse(tmplStr)
 	if err != nil {
