@@ -42,6 +42,7 @@ type Config struct {
 	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
 	CheckToolchainFunc          func(ctx context.Context) error
+	EnsurePassingTestsFunc      func(cfg *Config) error
 }
 
 // RepoPermissions captures repository access permissions from GitHub API.
@@ -136,6 +137,71 @@ func SetupDirectories(cfg *Config) error {
 				_ = os.WriteFile(gitkeep, []byte(""), 0644)
 			}
 		}
+	}
+
+	return nil
+}
+
+// HasExistingTests inspects rootDir to determine if any Go test files exist,
+// skipping .git and hidden directories.
+func HasExistingTests(rootDir string) (bool, error) {
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	hasTests := false
+	err := filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			if path != rootDir && (d.Name() == ".git" || strings.HasPrefix(d.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !strings.HasPrefix(d.Name(), ".") && strings.HasSuffix(d.Name(), "_test.go") {
+			hasTests = true
+			return filepath.SkipAll
+		}
+
+		return nil
+	})
+
+	return hasTests, err
+}
+
+// EnsurePassingTests verifies whether test files exist in the repository; if none are found,
+// it scaffolds an initial passing test in tests/init_test.go.
+func EnsurePassingTests(cfg *Config) error {
+	if cfg.EnsurePassingTestsFunc != nil {
+		return cfg.EnsurePassingTestsFunc(cfg)
+	}
+
+	rootDir := cfg.RootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	hasTests, err := HasExistingTests(rootDir)
+	if err != nil {
+		return fmt.Errorf("checking for existing tests: %w", err)
+	}
+
+	if hasTests {
+		return nil
+	}
+
+	testsDir := filepath.Join(rootDir, "tests")
+	if err := os.MkdirAll(testsDir, 0755); err != nil {
+		return fmt.Errorf("creating tests directory: %w", err)
+	}
+
+	initTestPath := filepath.Join(testsDir, "init_test.go")
+	if err := os.WriteFile(initTestPath, []byte(initTestTemplate), 0644); err != nil {
+		return fmt.Errorf("writing init_test.go: %w", err)
 	}
 
 	return nil
