@@ -727,6 +727,9 @@ type PRCheckItem struct {
 	Status     string `json:"status"`
 	State      string `json:"state"`
 	Conclusion string `json:"conclusion"`
+	DetailsURL string `json:"detailsUrl"`
+	TargetURL  string `json:"targetUrl"`
+	URL        string `json:"url"`
 }
 
 // PRViewStatus represents the JSON payload from gh pr view --json state,statusCheckRollup.
@@ -787,7 +790,28 @@ func PollPRStatus(ctx context.Context, cfg *Config, prURL string, timeout time.D
 				if reason == "" {
 					reason = check.State
 				}
-				return false, fmt.Errorf("status check %q failed with conclusion/state %s", checkName, reason)
+
+				link := check.DetailsURL
+				if link == "" {
+					link = check.TargetURL
+				}
+				if link == "" {
+					link = check.URL
+				}
+
+				var details []string
+				if check.Context != "" {
+					details = append(details, fmt.Sprintf("context: %s", check.Context))
+				}
+				if link != "" {
+					details = append(details, fmt.Sprintf("url: %s", link))
+				}
+
+				msg := fmt.Sprintf("status check %q failed with conclusion/state %s", checkName, reason)
+				if len(details) > 0 {
+					msg += fmt.Sprintf(" (%s)", strings.Join(details, ", "))
+				}
+				return false, errors.New(msg)
 			}
 		}
 
