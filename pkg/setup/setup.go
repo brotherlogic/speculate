@@ -641,22 +641,68 @@ func GitCommitAndPushBranch(ctx context.Context, cfg *Config, branchName string)
 		rootDir = "."
 	}
 
-	// 1. Switch and create branch: git checkout -b <branchName>
-	checkoutCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "checkout", "-b", branchName)
-	if out, err := checkoutCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git checkout -b %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
+	// 1. Check if branch exists locally; reset to main if existing, or create new branch
+	showRefCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
+	if showRefCmd.Run() == nil {
+		base := "main"
+		checkMain := exec.CommandContext(ctx, "git", "-C", rootDir, "show-ref", "--verify", "--quiet", "refs/heads/main")
+		if checkMain.Run() != nil {
+			checkOriginMain := exec.CommandContext(ctx, "git", "-C", rootDir, "show-ref", "--verify", "--quiet", "refs/remotes/origin/main")
+			if checkOriginMain.Run() == nil {
+				base = "origin/main"
+			} else {
+				base = "HEAD"
+			}
+		}
+		checkoutCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "checkout", "-B", branchName, base)
+		if out, err := checkoutCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git checkout -B %s %s failed: %s: %w", branchName, base, strings.TrimSpace(string(out)), err)
+		}
+	} else {
+		checkoutCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "checkout", "-b", branchName)
+		if out, err := checkoutCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git checkout -b %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
+		}
 	}
 
-	// 2. Commit staged files: git commit -m "chore: initialize speculate project scaffolding"
-	commitCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "commit", "-m", "chore: initialize speculate project scaffolding")
-	if out, err := commitCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git commit failed: %s: %w", strings.TrimSpace(string(out)), err)
+	// 2. Stage scaffolding paths (.github, specs, proto, tests, internal, go.mod, go.sum)
+	paths := []string{".github", "specs", "proto", "tests", "internal", "go.mod", "go.sum"}
+	var existingPaths []string
+	for _, p := range paths {
+		if _, err := os.Stat(filepath.Join(rootDir, p)); err == nil {
+			existingPaths = append(existingPaths, p)
+		}
 	}
 
-	// 3. Push branch: git push origin <branchName>
-	pushCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "push", "origin", branchName)
-	if out, err := pushCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git push origin %s failed: %s: %w", branchName, strings.TrimSpace(string(out)), err)
+	if len(existingPaths) > 0 {
+		args := append([]string{"-C", rootDir, "add"}, existingPaths...)
+		addCmd := exec.CommandContext(ctx, "git", args...)
+		if out, err := addCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git add failed: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
+
+	// 3. Only commit if changes are staged (git diff --cached --quiet), avoiding empty commit failures
+	diffCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "diff", "--cached", "--quiet")
+	if err := diffCmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			commitCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "commit", "-m", "chore: initialize speculate project scaffolding")
+			if out, err := commitCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("git commit failed: %s: %w", strings.TrimSpace(string(out)), err)
+			}
+		} else {
+			return fmt.Errorf("git diff --cached --quiet failed: %w", err)
+		}
+	}
+
+	// 4. Push branch to remote origin using git push -u origin <branchName> --force-with-lease (falling back to --force)
+	pushCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "push", "-u", "origin", branchName, "--force-with-lease")
+	if _, err := pushCmd.CombinedOutput(); err != nil {
+		forcePushCmd := exec.CommandContext(ctx, "git", "-C", rootDir, "push", "-u", "origin", branchName, "--force")
+		if outForce, errForce := forcePushCmd.CombinedOutput(); errForce != nil {
+			return fmt.Errorf("git push origin %s failed: %s: %w", branchName, strings.TrimSpace(string(outForce)), errForce)
+		}
 	}
 
 	return nil
