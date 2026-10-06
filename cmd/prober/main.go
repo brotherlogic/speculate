@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,12 +105,17 @@ func main() {
 	start := time.Now()
 	var runErr error
 
-	resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo)
+	repoExplicit := isFlagPassed("target-repo") || os.Getenv("PROBER_TARGET_REPO") != ""
+	resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo, repoExplicit)
 	if err != nil {
 		runErr = fmt.Errorf("resolving target repo: %w", err)
 		log.Printf("❌ Failed to resolve target repo: %v", err)
 	} else {
 		defer cleanup()
+
+		if resolvedDir == "example" && !repoExplicit {
+			*targetRepo = "brotherlogic/speculate"
+		}
 
 		switch *mode {
 		case "evaluator":
@@ -180,7 +186,47 @@ func fileProberIssue(issueRepo, mode, targetRepo, targetDir, token string, durat
 	}
 }
 
-func resolveTargetDir(ctx context.Context, dir, repoURL string) (string, func(), error) {
+func isFlagPassed(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+func determineTargetPackages(repoDir string) (string, string) {
+	goModPath := filepath.Join(repoDir, "go.mod")
+	if data, err := os.ReadFile(goModPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "module ") {
+				mod := strings.TrimSpace(strings.TrimPrefix(line, "module"))
+				return mod + "/internal/server", mod + "/proto/kv/v1"
+			}
+		}
+	}
+	return "github.com/brotherlogic/speculate/example/internal/server", "github.com/brotherlogic/speculate/example/proto/kv/v1"
+}
+
+func cloneTargetRepo(ctx context.Context, repoURL string) (string, func(), error) {
+	tempDir, err := os.MkdirTemp("", "speculate-target-*")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("creating temp dir: %w", err)
+	}
+	cleanup := func() { os.RemoveAll(tempDir) }
+
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, tempDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("cloning %s: %s: %w", repoURL, string(out), err)
+	}
+
+	return tempDir, cleanup, nil
+}
+
+func resolveTargetDir(ctx context.Context, dir, repoURL string, repoExplicit bool) (string, func(), error) {
 	noop := func() {}
 
 	if dir != "" {
@@ -189,31 +235,31 @@ func resolveTargetDir(ctx context.Context, dir, repoURL string) (string, func(),
 		}
 	}
 
-	// Check if /tmp/speculate-kv exists locally
+	// If the user explicitly provided an external target repo, clone it
+	if repoExplicit && repoURL != "" {
+		return cloneTargetRepo(ctx, repoURL)
+	}
+
+	// 1. Prioritize local example directory for local development
+	for _, p := range []string{"example/specs/kv.md", "../example/specs/kv.md", "../../example/specs/kv.md"} {
+		if _, err := os.Stat(p); err == nil {
+			return filepath.Dir(filepath.Dir(p)), noop, nil
+		}
+	}
+
+	// 2. Check if /tmp/speculate-kv exists locally
 	candidate := "/tmp/speculate-kv"
 	if _, err := os.Stat(candidate); err == nil {
 		return candidate, noop, nil
 	}
 
-	// Fallback to testdata if local
+	// 3. Fallback to testdata if local
 	if _, err := os.Stat("testdata/specs/kv.md"); err == nil {
 		return "testdata", noop, nil
 	}
 
 	// Otherwise clone target repo into a temp directory
-	tempDir, err := os.MkdirTemp("", "speculate-target-*")
-	if err != nil {
-		return "", noop, fmt.Errorf("creating temp dir: %w", err)
-	}
-	cleanup := func() { os.RemoveAll(tempDir) }
-
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, tempDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		cleanup()
-		return "", noop, fmt.Errorf("cloning %s: %s: %w", repoURL, string(out), err)
-	}
-
-	return tempDir, cleanup, nil
+	return cloneTargetRepo(ctx, repoURL)
 }
 
 func runEvaluatorProber(ctx context.Context, repoDir, targetRepo, ollamaEndpoint string) error {
@@ -273,6 +319,8 @@ func runEvaluatorProber(ctx context.Context, repoDir, targetRepo, ollamaEndpoint
 
 	fmt.Println("🔍 Step 4: Validating executable test code and running Mutation Probe (Red Phase)...")
 
+	serverPkg, protoPkg := determineTargetPackages(repoDir)
+
 	testCode := fmt.Sprintf(`package tests
 
 import (
@@ -284,13 +332,13 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/brotherlogic/speculate-kv/internal/server"
-	pb "github.com/brotherlogic/speculate-kv/proto/kv/v1"
+	"%s"
+	pb "%s"
 )
 
-// Stage: %s
-// Scenario: %s %s
-func %s(t *testing.T) {
+// Stage: %%s
+// Scenario: %%s %%s
+func %%s(t *testing.T) {
 	lis := bufconn.Listen(1024 * 1024)
 	s := grpc.NewServer()
 	pb.RegisterKVServer(s, server.New())
@@ -304,17 +352,19 @@ func %s(t *testing.T) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		t.Fatalf("failed to dial: %%v", err)
+		t.Fatalf("failed to dial: %%%%v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
 
 	client := pb.NewKVClient(conn)
 	_, err = client.Put(context.Background(), &pb.PutRequest{Key: "prober-key", Value: []byte("prober-value")})
 	if err != nil {
-		t.Fatalf("Put failed: %%v", err)
+		t.Fatalf("Put failed: %%%%v", err)
 	}
 }
-`, card.Stage, card.ID, card.Title, card.TestFuncName)
+`, serverPkg, protoPkg)
+
+	testCode = fmt.Sprintf(testCode, card.Stage, card.ID, card.Title, card.TestFuncName)
 
 	if err := synthesizer.ValidateGoCode(testCode); err != nil {
 		return fmt.Errorf("test code failed syntax validation: %w", err)
