@@ -102,17 +102,17 @@ flowchart LR
 **Goal:** Build client packages to manage GitHub resources on target repositories (`brotherlogic/speculate-kv`) and trigger Antigravity devcontainer environments via `devcontainer-manager`.
 
 ### Tasks
-* [ ] **Task 3.1: GitHub Client Adapter (`pkg/github`)**
+* [x] **Task 3.1: GitHub Client Adapter (`pkg/github`)**
   * Manage feature branches (`feat/<stage>`) and test branches (`test/<scenario>`) on the target repository.
   * Create issues with required labels (`speculate-agentic-loop`, `speculate-align`, `speculate-stalled`).
   * Open Pull Requests targeting `feat/<stage>`.
   * Update the README alignment badge and perform squash merges.
-* [ ] **Task 3.2: DCM gRPC Client Adapter (`pkg/dcm`)**
+* [x] **Task 3.2: DCM gRPC Client Adapter (`pkg/dcm`)**
   * Connect to `devcontainer-manager` gRPC service.
   * Implement `Up(repo, branch, harness)` and `PushPrompt(containerID, prompt)`.
   * Implement polling / health check for container readiness.
 
-### 🔍 Self-Reflection Prober 3: Integration Client Prober
+### 🔍 Self-Reflection Prober 3: Integration Client Prober (PASSED)
 * **Target:** `go run cmd/prober/main.go --mode=clients --dry-run`
 * **Verification Criteria:**
   * Validates GitHub API client against live repository or mock server (issues, branches, labels).
