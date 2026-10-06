@@ -850,6 +850,300 @@ func TestGitCommitAndPushBranch_Success(t *testing.T) {
 	}
 }
 
+func TestGitCommitAndPushBranch_ExistingLocalAndRemoteBranch(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	bareRemote := t.TempDir()
+	cmdInitBare := exec.Command("git", "init", "--bare")
+	cmdInitBare.Dir = bareRemote
+	if out, err := cmdInitBare.CombinedOutput(); err != nil {
+		t.Fatalf("failed initializing bare remote: %s: %v", string(out), err)
+	}
+
+	cmdRemote := exec.Command("git", "remote", "add", "origin", bareRemote)
+	cmdRemote.Dir = tempDir
+	if out, err := cmdRemote.CombinedOutput(); err != nil {
+		t.Fatalf("failed adding remote origin: %s: %v", string(out), err)
+	}
+
+	// Create initial commit on main
+	initialFile := filepath.Join(tempDir, "README.md")
+	if err := os.WriteFile(initialFile, []byte("# Test"), 0644); err != nil {
+		t.Fatalf("failed writing initial file: %v", err)
+	}
+	cmdAdd := exec.Command("git", "add", "README.md")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+	cmdBranchMain := exec.Command("git", "branch", "-M", "main")
+	cmdBranchMain.Dir = tempDir
+	if out, err := cmdBranchMain.CombinedOutput(); err != nil {
+		t.Fatalf("git branch -M main failed: %s: %v", string(out), err)
+	}
+	cmdPushMain := exec.Command("git", "push", "-u", "origin", "main")
+	cmdPushMain.Dir = tempDir
+	if out, err := cmdPushMain.CombinedOutput(); err != nil {
+		t.Fatalf("git push main failed: %s: %v", string(out), err)
+	}
+
+	branchName := "feature/speculate-scaffolding"
+
+	// Create pre-existing local branch and push to remote
+	cmdCheckoutB := exec.Command("git", "checkout", "-b", branchName)
+	cmdCheckoutB.Dir = tempDir
+	if out, err := cmdCheckoutB.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout -b failed: %s: %v", string(out), err)
+	}
+	oldFile := filepath.Join(tempDir, "old.txt")
+	if err := os.WriteFile(oldFile, []byte("old content"), 0644); err != nil {
+		t.Fatalf("failed writing old file: %v", err)
+	}
+	cmdAddOld := exec.Command("git", "add", "old.txt")
+	cmdAddOld.Dir = tempDir
+	if out, err := cmdAddOld.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommitOld := exec.Command("git", "commit", "-m", "old commit on branch")
+	cmdCommitOld.Dir = tempDir
+	if out, err := cmdCommitOld.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+	cmdPushBranch := exec.Command("git", "push", "-u", "origin", branchName)
+	cmdPushBranch.Dir = tempDir
+	if out, err := cmdPushBranch.CombinedOutput(); err != nil {
+		t.Fatalf("git push branch failed: %s: %v", string(out), err)
+	}
+
+	// Switch back to main
+	cmdCheckoutMain := exec.Command("git", "checkout", "main")
+	cmdCheckoutMain.Dir = tempDir
+	if out, err := cmdCheckoutMain.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout main failed: %s: %v", string(out), err)
+	}
+
+	// Create scaffolding directory and file
+	specsDir := filepath.Join(tempDir, "specs")
+	if err := os.MkdirAll(specsDir, 0755); err != nil {
+		t.Fatalf("failed creating specs dir: %v", err)
+	}
+	scaffoldFile := filepath.Join(specsDir, "spec.md")
+	if err := os.WriteFile(scaffoldFile, []byte("# New Spec Scaffolding"), 0644); err != nil {
+		t.Fatalf("failed writing scaffold file: %v", err)
+	}
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	// Run GitCommitAndPushBranch - it should reset the existing branch to main, stage specs, commit, and push
+	if err := GitCommitAndPushBranch(context.Background(), cfg, branchName); err != nil {
+		t.Fatalf("GitCommitAndPushBranch failed on existing local and remote branch: %v", err)
+	}
+
+	// Verify current branch is branchName
+	cmdBranch := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmdBranch.Dir = tempDir
+	outBranch, err := cmdBranch.Output()
+	if err != nil {
+		t.Fatalf("failed getting current branch: %v", err)
+	}
+	if strings.TrimSpace(string(outBranch)) != branchName {
+		t.Errorf("expected branch %q, got %q", branchName, strings.TrimSpace(string(outBranch)))
+	}
+
+	// Verify old.txt does NOT exist on the reset branch (it was reset to main)
+	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
+		t.Errorf("expected old.txt to not exist after resetting to main, but it was found")
+	}
+
+	// Verify specs/spec.md exists on branch
+	if _, err := os.Stat(scaffoldFile); err != nil {
+		t.Errorf("expected specs/spec.md to exist: %v", err)
+	}
+
+	// Verify remote ref matches local branch commit
+	cmdLocalCommit := exec.Command("git", "rev-parse", "HEAD")
+	cmdLocalCommit.Dir = tempDir
+	localCommitOut, err := cmdLocalCommit.Output()
+	if err != nil {
+		t.Fatalf("failed getting local commit: %v", err)
+	}
+
+	cmdRemoteCommit := exec.Command("git", "--git-dir", bareRemote, "rev-parse", "refs/heads/"+branchName)
+	remoteCommitOut, err := cmdRemoteCommit.Output()
+	if err != nil {
+		t.Fatalf("failed getting remote commit: %v", err)
+	}
+
+	if strings.TrimSpace(string(localCommitOut)) != strings.TrimSpace(string(remoteCommitOut)) {
+		t.Errorf("expected remote commit %q to match local commit %q", strings.TrimSpace(string(remoteCommitOut)), strings.TrimSpace(string(localCommitOut)))
+	}
+}
+
+func TestGitCommitAndPushBranch_ForcePushFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	bareRemote := t.TempDir()
+	cmdInitBare := exec.Command("git", "init", "--bare")
+	cmdInitBare.Dir = bareRemote
+	if out, err := cmdInitBare.CombinedOutput(); err != nil {
+		t.Fatalf("failed initializing bare remote: %s: %v", string(out), err)
+	}
+
+	cmdRemote := exec.Command("git", "remote", "add", "origin", bareRemote)
+	cmdRemote.Dir = tempDir
+	if out, err := cmdRemote.CombinedOutput(); err != nil {
+		t.Fatalf("failed adding remote origin: %s: %v", string(out), err)
+	}
+
+	// Create initial commit on main
+	initialFile := filepath.Join(tempDir, "README.md")
+	if err := os.WriteFile(initialFile, []byte("# Test"), 0644); err != nil {
+		t.Fatalf("failed writing initial file: %v", err)
+	}
+	cmdAdd := exec.Command("git", "add", "README.md")
+	cmdAdd.Dir = tempDir
+	if out, err := cmdAdd.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	if out, err := cmdCommit.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+	cmdBranchMain := exec.Command("git", "branch", "-M", "main")
+	cmdBranchMain.Dir = tempDir
+	if out, err := cmdBranchMain.CombinedOutput(); err != nil {
+		t.Fatalf("git branch -M main failed: %s: %v", string(out), err)
+	}
+	cmdPushMain := exec.Command("git", "push", "-u", "origin", "main")
+	cmdPushMain.Dir = tempDir
+	if out, err := cmdPushMain.CombinedOutput(); err != nil {
+		t.Fatalf("git push main failed: %s: %v", string(out), err)
+	}
+
+	branchName := "feature/speculate-scaffolding"
+
+	// Create branch in local1 and push it
+	cmdCheckoutB := exec.Command("git", "checkout", "-b", branchName)
+	cmdCheckoutB.Dir = tempDir
+	if out, err := cmdCheckoutB.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout -b failed: %s: %v", string(out), err)
+	}
+	cmdPushBranch := exec.Command("git", "push", "-u", "origin", branchName)
+	cmdPushBranch.Dir = tempDir
+	if out, err := cmdPushBranch.CombinedOutput(); err != nil {
+		t.Fatalf("git push branch failed: %s: %v", string(out), err)
+	}
+
+	// Clone to local2 and push a commit to the remote branch so local1's lease tracking is stale
+	tempDir2 := t.TempDir()
+	cmdClone := exec.Command("git", "clone", bareRemote, tempDir2)
+	if out, err := cmdClone.CombinedOutput(); err != nil {
+		t.Fatalf("git clone failed: %s: %v", string(out), err)
+	}
+	initGitRepo(t, tempDir2)
+	cmdCheckoutB2 := exec.Command("git", "checkout", branchName)
+	cmdCheckoutB2.Dir = tempDir2
+	if out, err := cmdCheckoutB2.CombinedOutput(); err != nil {
+		t.Fatalf("git checkout failed in clone: %s: %v", string(out), err)
+	}
+	otherFile := filepath.Join(tempDir2, "other.txt")
+	if err := os.WriteFile(otherFile, []byte("divergent commit"), 0644); err != nil {
+		t.Fatalf("failed writing other.txt: %v", err)
+	}
+	cmdAdd2 := exec.Command("git", "add", "other.txt")
+	cmdAdd2.Dir = tempDir2
+	if out, err := cmdAdd2.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+	cmdCommit2 := exec.Command("git", "commit", "-m", "divergent remote commit")
+	cmdCommit2.Dir = tempDir2
+	if out, err := cmdCommit2.CombinedOutput(); err != nil {
+		t.Fatalf("git commit failed: %s: %v", string(out), err)
+	}
+	cmdPush2 := exec.Command("git", "push", "origin", branchName)
+	cmdPush2.Dir = tempDir2
+	if out, err := cmdPush2.CombinedOutput(); err != nil {
+		t.Fatalf("git push failed from clone: %s: %v", string(out), err)
+	}
+
+	// In local1, add scaffolding file
+	scaffoldFile := filepath.Join(tempDir, "specs.md")
+	if err := os.WriteFile(scaffoldFile, []byte("# Spec"), 0644); err != nil {
+		t.Fatalf("failed writing scaffold file: %v", err)
+	}
+	cmdAddScaffold := exec.Command("git", "add", "specs.md")
+	cmdAddScaffold.Dir = tempDir
+	if out, err := cmdAddScaffold.CombinedOutput(); err != nil {
+		t.Fatalf("git add failed: %s: %v", string(out), err)
+	}
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Owner:   "brotherlogic",
+	}
+
+	// GitCommitAndPushBranch will try --force-with-lease (which will fail due to stale info) and fall back to --force successfully
+	if err := GitCommitAndPushBranch(context.Background(), cfg, branchName); err != nil {
+		t.Fatalf("expected fallback to --force to succeed, got error: %v", err)
+	}
+}
+
+func TestGitCommitAndPushBranch_NothingStagedAvoidsEmptyCommit(t *testing.T) {
+	tempDir := t.TempDir()
+	initGitRepo(t, tempDir)
+
+	bareRemote := t.TempDir()
+	cmdInitBare := exec.Command("git", "init", "--bare")
+	cmdInitBare.Dir = bareRemote
+	if out, err := cmdInitBare.CombinedOutput(); err != nil {
+		t.Fatalf("failed initializing bare remote: %s: %v", string(out), err)
+	}
+
+	cmdRemote := exec.Command("git", "remote", "add", "origin", bareRemote)
+	cmdRemote.Dir = tempDir
+	if out, err := cmdRemote.CombinedOutput(); err != nil {
+		t.Fatalf("failed adding remote origin: %s: %v", string(out), err)
+	}
+
+	// Make an initial commit
+	initialFile := filepath.Join(tempDir, "README.md")
+	if err := os.WriteFile(initialFile, []byte("# Test"), 0644); err != nil {
+		t.Fatalf("failed writing initial file: %v", err)
+	}
+	cmdAdd := exec.Command("git", "add", "README.md")
+	cmdAdd.Dir = tempDir
+	_ = cmdAdd.Run()
+	cmdCommit := exec.Command("git", "commit", "-m", "initial commit")
+	cmdCommit.Dir = tempDir
+	_ = cmdCommit.Run()
+	cmdBranchMain := exec.Command("git", "branch", "-M", "main")
+	cmdBranchMain.Dir = tempDir
+	_ = cmdBranchMain.Run()
+	cmdPushMain := exec.Command("git", "push", "-u", "origin", "main")
+	cmdPushMain.Dir = tempDir
+	_ = cmdPushMain.Run()
+
+	cfg := &Config{RootDir: tempDir}
+	// Nothing staged, so commit is skipped to avoid empty commit failure, and push succeeds
+	err := GitCommitAndPushBranch(context.Background(), cfg, "feature/clean-branch")
+	if err != nil {
+		t.Fatalf("expected no error when nothing is staged to commit, got: %v", err)
+	}
+}
+
 func TestGitCommitAndPushBranch_InvalidBranch(t *testing.T) {
 	tempDir := t.TempDir()
 	initGitRepo(t, tempDir)
