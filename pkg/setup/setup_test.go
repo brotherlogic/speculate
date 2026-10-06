@@ -1287,7 +1287,13 @@ func TestCreatePullRequest_EmptyBranch(t *testing.T) {
 }
 
 func TestCreatePullRequest_CommandExecutionAndURLParsing(t *testing.T) {
-	_, logFile := setupMockGH(t, "echo 'https://github.com/brotherlogic/test-repo/pull/42'")
+	script := `
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  exit 0
+fi
+echo 'https://github.com/brotherlogic/test-repo/pull/42'
+`
+	_, logFile := setupMockGH(t, script)
 
 	cfg := &Config{RootDir: t.TempDir()}
 	url, err := CreatePullRequest(context.Background(), cfg, "feature/init-branch")
@@ -1303,14 +1309,21 @@ func TestCreatePullRequest_CommandExecutionAndURLParsing(t *testing.T) {
 		t.Fatalf("failed reading mock gh args log: %v", err)
 	}
 	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
-	expectedArgs := "pr create --base main --head feature/init-branch --title chore: initialize speculate project scaffolding --body Initial speculate scaffolding (directory structure, GitHub workflows, and CODEOWNERS)."
+	expectedArgs := "pr list --head feature/init-branch --base main --state open --json url --jq .[0].url\npr create --base main --head feature/init-branch --title chore: initialize speculate project scaffolding --body Initial speculate scaffolding (directory structure, GitHub workflows, and CODEOWNERS)."
 	if loggedArgs != expectedArgs {
 		t.Errorf("expected gh command args:\n%q\ngot:\n%q", expectedArgs, loggedArgs)
 	}
 }
 
 func TestCreatePullRequest_MultilineOutputURLParsing(t *testing.T) {
-	multilineScript := "echo 'Creating pull request for feature/init-branch into main in brotherlogic/test-repo'\necho 'https://github.com/brotherlogic/test-repo/pull/88'\necho ''"
+	multilineScript := `
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  exit 0
+fi
+echo 'Creating pull request for feature/init-branch into main in brotherlogic/test-repo'
+echo 'https://github.com/brotherlogic/test-repo/pull/88'
+echo ''
+`
 	setupMockGH(t, multilineScript)
 
 	cfg := &Config{RootDir: t.TempDir()}
@@ -1324,7 +1337,14 @@ func TestCreatePullRequest_MultilineOutputURLParsing(t *testing.T) {
 }
 
 func TestCreatePullRequest_CommandFailure(t *testing.T) {
-	setupMockGH(t, "echo 'GraphQL error: A pull request already exists' >&2\nexit 1")
+	script := `
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  exit 0
+fi
+echo 'GraphQL error: A pull request already exists' >&2
+exit 1
+`
+	setupMockGH(t, script)
 
 	cfg := &Config{RootDir: t.TempDir()}
 	_, err := CreatePullRequest(context.Background(), cfg, "feature/init-branch")
@@ -1333,6 +1353,71 @@ func TestCreatePullRequest_CommandFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "gh pr create failed") {
 		t.Errorf("expected error message to contain 'gh pr create failed', got %v", err)
+	}
+}
+
+func TestCreatePullRequest_ReusesOpenPR(t *testing.T) {
+	script := `
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  echo "https://github.com/brotherlogic/test-repo/pull/55"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  echo "SHOULD NOT BE CALLED" >&2
+  exit 1
+fi
+`
+	_, logFile := setupMockGH(t, script)
+
+	cfg := &Config{RootDir: t.TempDir()}
+	url, err := CreatePullRequest(context.Background(), cfg, "feature/reuse-branch")
+	if err != nil {
+		t.Fatalf("unexpected error from CreatePullRequest: %v", err)
+	}
+	if url != "https://github.com/brotherlogic/test-repo/pull/55" {
+		t.Errorf("expected reused url %q, got %q", "https://github.com/brotherlogic/test-repo/pull/55", url)
+	}
+
+	loggedArgsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed reading mock gh args log: %v", err)
+	}
+	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
+	expectedArgs := "pr list --head feature/reuse-branch --base main --state open --json url --jq .[0].url"
+	if loggedArgs != expectedArgs {
+		t.Errorf("expected gh args:\n%q\ngot:\n%q", expectedArgs, loggedArgs)
+	}
+}
+
+func TestCreatePullRequest_CreatesNewWhenNoOpenPR(t *testing.T) {
+	script := `
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  echo "https://github.com/brotherlogic/test-repo/pull/56"
+  exit 0
+fi
+`
+	_, logFile := setupMockGH(t, script)
+
+	cfg := &Config{RootDir: t.TempDir()}
+	url, err := CreatePullRequest(context.Background(), cfg, "feature/new-branch")
+	if err != nil {
+		t.Fatalf("unexpected error from CreatePullRequest: %v", err)
+	}
+	if url != "https://github.com/brotherlogic/test-repo/pull/56" {
+		t.Errorf("expected created url %q, got %q", "https://github.com/brotherlogic/test-repo/pull/56", url)
+	}
+
+	loggedArgsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed reading mock gh args log: %v", err)
+	}
+	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
+	expectedArgs := "pr list --head feature/new-branch --base main --state open --json url --jq .[0].url\npr create --base main --head feature/new-branch --title chore: initialize speculate project scaffolding --body Initial speculate scaffolding (directory structure, GitHub workflows, and CODEOWNERS)."
+	if loggedArgs != expectedArgs {
+		t.Errorf("expected gh args:\n%q\ngot:\n%q", expectedArgs, loggedArgs)
 	}
 }
 

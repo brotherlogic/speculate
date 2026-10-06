@@ -721,6 +721,25 @@ func CreatePullRequest(ctx context.Context, cfg *Config, branchName string) (str
 		return cfg.CreatePRFunc(ctx, cfg, branchName, title, body)
 	}
 
+	listCmd := ghCmd(ctx, cfg, "pr", "list", "--head", branchName, "--base", "main", "--state", "open", "--json", "url", "--jq", ".[0].url")
+	listOut, err := listCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr list failed: %s: %w", strings.TrimSpace(string(listOut)), err)
+	}
+
+	existingPR := strings.TrimSpace(string(listOut))
+	if existingPR != "" && existingPR != "null" {
+		for _, line := range strings.Split(existingPR, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+				existingPR = trimmed
+				break
+			}
+		}
+		log.Printf("Existing open pull request detected: %s, reusing.", existingPR)
+		return existingPR, nil
+	}
+
 	cmd := ghCmd(ctx, cfg, "pr", "create", "--base", "main", "--head", branchName, "--title", title, "--body", body)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
