@@ -1514,6 +1514,60 @@ func TestPollPRStatus_AbortOnCheckFailure(t *testing.T) {
 			if !strings.Contains(err.Error(), "test") {
 				t.Errorf("expected error message to mention failing check name 'test', got %v", err)
 			}
+			if tc.conclusion != "" && !strings.Contains(err.Error(), tc.conclusion) {
+				t.Errorf("expected error message to mention failure conclusion %q, got %v", tc.conclusion, err)
+			}
+			if tc.state != "" && !strings.Contains(err.Error(), tc.state) {
+				t.Errorf("expected error message to mention failure state %q, got %v", tc.state, err)
+			}
+		})
+	}
+}
+
+func TestPollPRStatus_DiagnosticFailureDetails(t *testing.T) {
+	tests := []struct {
+		name            string
+		jsonPayload     string
+		expectedStrings []string
+	}{
+		{
+			name: "check run with details url, context, and failure conclusion",
+			jsonPayload: `{"state":"OPEN","statusCheckRollup":[{"__typename":"CheckRun","name":"ci/build","context":"test-matrix","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://github.com/brotherlogic/speculate/actions/runs/123/job/456"}]}`,
+			expectedStrings: []string{
+				"ci/build",
+				"FAILURE",
+				"test-matrix",
+				"https://github.com/brotherlogic/speculate/actions/runs/123/job/456",
+			},
+		},
+		{
+			name: "status context with target url, error state, and context",
+			jsonPayload: `{"state":"OPEN","statusCheckRollup":[{"__typename":"StatusContext","context":"continuous-integration/travis-ci","state":"ERROR","targetUrl":"https://travis-ci.com/builds/789"}]}`,
+			expectedStrings: []string{
+				"continuous-integration/travis-ci",
+				"ERROR",
+				"https://travis-ci.com/builds/789",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setupMockGH(t, `echo '`+tc.jsonPayload+`'`)
+
+			cfg := &Config{
+				RootDir:      t.TempDir(),
+				PollInterval: 10 * time.Millisecond,
+			}
+			err := PollPRStatus(context.Background(), cfg, "https://github.com/brotherlogic/test-repo/pull/42", 5*time.Second)
+			if err == nil {
+				t.Fatalf("expected error on check failure, got nil")
+			}
+			for _, expected := range tc.expectedStrings {
+				if !strings.Contains(err.Error(), expected) {
+					t.Errorf("expected error message to contain %q, but got: %v", expected, err)
+				}
+			}
 		})
 	}
 }
