@@ -19,7 +19,12 @@ jobs:
       pull-requests: write
     steps:
       - name: Enable auto-merge
+        env:
+          RAW_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          SAN_TOKEN=$(printf '%s' "$RAW_TOKEN" | tr -d '\r\n[:space:]')
+          export GH_TOKEN="${SAN_TOKEN:-$FALLBACK_TOKEN}"
           if [ "${{ github.event_name }}" == "pull_request" ]; then
             PR_URL="${{ github.event.pull_request.html_url }}"
           else
@@ -31,5 +36,3 @@ jobs:
           else
             echo "No associated PR found for this event."
           fi
-        env:
-          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.GITHUB_TOKEN }}
