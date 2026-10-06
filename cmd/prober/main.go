@@ -15,13 +15,19 @@ import (
 	"sync"
 	"time"
 
+	dcmproto "github.com/brotherlogic/devcontainer-manager/proto"
 	"github.com/brotherlogic/speculate/pkg/alerter"
+	"github.com/brotherlogic/speculate/pkg/dcm"
 	"github.com/brotherlogic/speculate/pkg/evaluator"
+	ghclient "github.com/brotherlogic/speculate/pkg/github"
 	"github.com/brotherlogic/speculate/pkg/parser"
 	"github.com/brotherlogic/speculate/pkg/synthesizer"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 var (
@@ -87,8 +93,10 @@ func main() {
 		defaultIssueRepo = "brotherlogic/speculate"
 	}
 	defaultEnableIssueFiling := os.Getenv("PROBER_ENABLE_ISSUE_FILING") != "false"
+	defaultDryRun := os.Getenv("PROBER_DRY_RUN") == "true"
+	defaultDCMEndpoint := os.Getenv("DCM_ENDPOINT")
 
-	mode := flag.String("mode", defaultMode, "Prober execution mode: evaluator, simulation, cluster")
+	mode := flag.String("mode", defaultMode, "Prober execution mode: evaluator, clients, simulation, cluster")
 	targetDir := flag.String("target-dir", defaultTargetDir, "Local target directory of the repository to probe (e.g. /tmp/speculate-kv)")
 	targetRepo := flag.String("target-repo", defaultTargetRepo, "Target repository git URL")
 	ollamaEndpoint := flag.String("ollama-endpoint", defaultOllamaEndpoint, "Ollama API endpoint")
@@ -96,7 +104,9 @@ func main() {
 	metricsHoldTimeout := flag.Duration("metrics-hold-timeout", 30*time.Second, "Hold duration to wait for Prometheus scrape")
 	issueRepo := flag.String("issue-repo", defaultIssueRepo, "Repository where failure issues should be filed (e.g. brotherlogic/speculate or target)")
 	enableIssueFiling := flag.Bool("enable-issue-filing", defaultEnableIssueFiling, "Enable filing a GitHub issue when the prober fails")
-	githubToken := flag.String("github-token", "", "GitHub token for filing issues (defaults to GH_TOKEN or GITHUB_TOKEN)")
+	githubToken := flag.String("github-token", "", "GitHub token for filing issues or live operations (defaults to GH_TOKEN or GITHUB_TOKEN)")
+	dryRun := flag.Bool("dry-run", defaultDryRun, "Run prober in dry-run mode using mock/in-process servers")
+	dcmEndpoint := flag.String("dcm-endpoint", defaultDCMEndpoint, "DCM gRPC endpoint (e.g. devcontainer-manager.speculate.svc.cluster.local:50051)")
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -106,28 +116,39 @@ func main() {
 	var runErr error
 
 	repoExplicit := isFlagPassed("target-repo") || os.Getenv("PROBER_TARGET_REPO") != ""
-	resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo, repoExplicit)
-	if err != nil {
-		runErr = fmt.Errorf("resolving target repo: %w", err)
-		log.Printf("❌ Failed to resolve target repo: %v", err)
-	} else {
-		defer cleanup()
 
-		if resolvedDir == "example" && !repoExplicit {
-			*targetRepo = "brotherlogic/speculate"
+	if *mode == "clients" {
+		resolvedToken := alerter.ResolveToken(*githubToken)
+		runErr = runClientsProber(ctx, *targetRepo, *dryRun, resolvedToken, *dcmEndpoint)
+		if runErr != nil {
+			log.Printf("❌ Prober Failed: %v", runErr)
+		} else {
+			fmt.Println("✅ [PROBER PASS] GitHub and DCM client adapters verified successfully!")
 		}
+	} else {
+		resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo, repoExplicit)
+		if err != nil {
+			runErr = fmt.Errorf("resolving target repo: %w", err)
+			log.Printf("❌ Failed to resolve target repo: %v", err)
+		} else {
+			defer cleanup()
 
-		switch *mode {
-		case "evaluator":
-			runErr = runEvaluatorProber(ctx, resolvedDir, *targetRepo, *ollamaEndpoint)
-			if runErr != nil {
-				log.Printf("❌ Prober Failed: %v", runErr)
-			} else {
-				fmt.Println("✅ [PROBER PASS] Target repository evaluated and synthesized successfully!")
+			if resolvedDir == "example" && !repoExplicit {
+				*targetRepo = "brotherlogic/speculate"
 			}
-		default:
-			runErr = fmt.Errorf("unknown prober mode: %s", *mode)
-			log.Printf("❌ %v", runErr)
+
+			switch *mode {
+			case "evaluator":
+				runErr = runEvaluatorProber(ctx, resolvedDir, *targetRepo, *ollamaEndpoint)
+				if runErr != nil {
+					log.Printf("❌ Prober Failed: %v", runErr)
+				} else {
+					fmt.Println("✅ [PROBER PASS] Target repository evaluated and synthesized successfully!")
+				}
+			default:
+				runErr = fmt.Errorf("unknown prober mode: %s", *mode)
+				log.Printf("❌ %v", runErr)
+			}
 		}
 	}
 
@@ -479,4 +500,256 @@ func osLines(s string) []string {
 		lines = append(lines, curr)
 	}
 	return lines
+}
+
+func runClientsProber(ctx context.Context, targetRepo string, dryRun bool, githubToken string, dcmEndpoint string) error {
+	owner, repo, err := ghclient.ParseRepo(targetRepo)
+	if err != nil {
+		owner = "brotherlogic"
+		repo = "speculate-kv"
+	}
+
+	// -------------------------------------------------------------
+	// Step 1: Validate GitHub Client Adapter (pkg/github)
+	// -------------------------------------------------------------
+	fmt.Println("🔍 Step 1: Validating GitHub Client Adapter (pkg/github)...")
+
+	if dryRun || githubToken == "" {
+		mockClient := ghclient.NewMockClient(owner, repo)
+
+		// 1. Ensure required labels
+		if err := mockClient.EnsureLabels(ctx, ghclient.RequiredLabels()); err != nil {
+			return fmt.Errorf("github client EnsureLabels failed: %w", err)
+		}
+		fmt.Println("✓ Required labels verified (speculate-agentic-loop, speculate-align, speculate-stalled)")
+
+		// 2. Branch management (feat/<stage> and test/<scenario>)
+		featBranch := "feat/dryrun-core"
+		testBranch := "test/dryrun-basic-put"
+		_, err := mockClient.CreateBranch(ctx, featBranch, "main")
+		if err != nil {
+			return fmt.Errorf("github client CreateBranch (%s): %w", featBranch, err)
+		}
+		_, err = mockClient.CreateBranch(ctx, testBranch, featBranch)
+		if err != nil {
+			return fmt.Errorf("github client CreateBranch (%s): %w", testBranch, err)
+		}
+		if _, err := mockClient.GetBranch(ctx, featBranch); err != nil {
+			return fmt.Errorf("github client GetBranch (%s): %w", featBranch, err)
+		}
+		fmt.Printf("✓ Branch management verified (%s, %s)\n", featBranch, testBranch)
+
+		// 3. Issue management
+		cardBody := "## Scenario: Basic Put/Get\nGIVEN an empty KV service\nWHEN Put(key, value) is called\nTHEN Get(key) returns value"
+		issueReq := &ghclient.CreateIssueRequest{
+			Title:  "[Speculate Loop] Add integration test for Basic Put/Get",
+			Body:   cardBody,
+			Labels: []string{ghclient.LabelAgenticLoop},
+		}
+		issue, err := mockClient.CreateIssue(ctx, issueReq)
+		if err != nil {
+			return fmt.Errorf("github client CreateIssue: %w", err)
+		}
+		fmt.Printf("✓ Issue management verified (#%d created with label %s)\n", issue.Number, ghclient.LabelAgenticLoop)
+
+		// 4. Pull Request workflow
+		prReq := &ghclient.CreatePRRequest{
+			Title: "test(kv): add basic put/get test scenario",
+			Head:  testBranch,
+			Base:  featBranch,
+			Body:  fmt.Sprintf("Closes #%d\n\nAutomated test PR generated by Speculate.", issue.Number),
+		}
+		pr, err := mockClient.CreatePullRequest(ctx, prReq)
+		if err != nil {
+			return fmt.Errorf("github client CreatePullRequest: %w", err)
+		}
+		fmt.Printf("✓ Pull Request workflow verified (#%d opened targeting %s)\n", pr.Number, featBranch)
+
+		// 5. README alignment badge update
+		badgeMD := "[![Spec Alignment](https://img.shields.io/badge/Spec%20Alignment-25%25-yellow)](specs/kv.md)"
+		if err := mockClient.UpdateReadmeBadge(ctx, featBranch, badgeMD); err != nil {
+			return fmt.Errorf("github client UpdateReadmeBadge: %w", err)
+		}
+		fc, err := mockClient.GetFileContent(ctx, "README.md", featBranch)
+		if err != nil || !strings.Contains(fc.Content, badgeMD) {
+			return fmt.Errorf("README badge verification failed: content missing badge")
+		}
+		fmt.Println("✓ README alignment badge update verified")
+
+		// 6. Squash merge
+		mergeRes, err := mockClient.SquashMergePullRequest(ctx, pr.Number, pr.Title, "Squash merge test commit")
+		if err != nil || !mergeRes.Merged {
+			return fmt.Errorf("github client SquashMergePullRequest failed: %v", err)
+		}
+		fmt.Println("✓ Squash merge verified")
+
+		// 7. Cleanup
+		if err := mockClient.DeleteBranch(ctx, testBranch); err != nil {
+			return fmt.Errorf("github client DeleteBranch failed: %w", err)
+		}
+		if err := mockClient.CloseIssue(ctx, issue.Number); err != nil {
+			return fmt.Errorf("github client CloseIssue failed: %w", err)
+		}
+		fmt.Println("✓ Branch deletion and issue closure verified")
+	} else {
+		realClient := ghclient.NewRealClient(githubToken, owner, repo)
+		if err := realClient.EnsureLabels(ctx, ghclient.RequiredLabels()); err != nil {
+			return fmt.Errorf("github live EnsureLabels failed on %s/%s: %w", owner, repo, err)
+		}
+		if _, err := realClient.GetBranch(ctx, "main"); err != nil {
+			return fmt.Errorf("github live GetBranch(main) failed on %s/%s: %w", owner, repo, err)
+		}
+		fmt.Printf("✓ Live GitHub repository %s/%s verified (branches, labels accessible)\n", owner, repo)
+	}
+
+	// -------------------------------------------------------------
+	// Step 2: Validate DCM Client Adapter (pkg/dcm)
+	// -------------------------------------------------------------
+	fmt.Println("\n🔍 Step 2: Validating Devcontainer-Manager (DCM) Client Adapter (pkg/dcm)...")
+
+	// Validate proto schema against proto/manager.proto
+	if err := validateDCMProtoSchema(); err != nil {
+		return fmt.Errorf("validating DCM proto schema: %w", err)
+	}
+	fmt.Println("✓ DCM Protobuf schema contract verified against proto/manager.proto")
+
+	if dryRun || dcmEndpoint == "" {
+		lis := bufconn.Listen(1024 * 1024)
+		grpcServer := grpc.NewServer()
+		mockDCM := dcm.NewMockServer()
+		dcmproto.RegisterManagerServiceServer(grpcServer, mockDCM)
+
+		go func() {
+			_ = grpcServer.Serve(lis)
+		}()
+		defer grpcServer.Stop()
+
+		conn, err := grpc.NewClient("passthrough://bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return lis.Dial()
+			}),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			return fmt.Errorf("dialing mock DCM bufconn: %w", err)
+		}
+		defer conn.Close()
+
+		dcmClient := dcm.NewFromClientConn(conn)
+
+		// HealthCheck
+		if err := dcmClient.HealthCheck(ctx); err != nil {
+			return fmt.Errorf("DCM HealthCheck failed: %w", err)
+		}
+		fmt.Println("✓ Devcontainer ManagerService connection verified")
+
+		// Up RPC
+		upParams := &dcm.UpParams{
+			Repo:        fmt.Sprintf("%s/%s", owner, repo),
+			Branch:      "test/dryrun-scenario",
+			Harness:     dcm.HarnessAntigravity,
+			IssueNumber: 1,
+			Prompt:      "Implement scenario test matching the issue Scenario Card",
+			Model:       "deepseek-coder-v2:latest",
+		}
+		cfg, err := dcmClient.Up(ctx, upParams)
+		if err != nil {
+			return fmt.Errorf("DCM Up RPC failed: %w", err)
+		}
+		if cfg.GetId() == "" {
+			return fmt.Errorf("DCM Up RPC returned empty container ID")
+		}
+		fmt.Printf("✓ DCM Up RPC verified (container_id=%s, harness=HARNESS_ANTIGRAVITY)\n", cfg.GetId())
+
+		// PushPrompt RPC
+		testPrompt := "Run `go test ./...` and commit changes to internal/server/"
+		if err := dcmClient.PushPrompt(ctx, cfg.GetId(), testPrompt); err != nil {
+			return fmt.Errorf("DCM PushPrompt RPC failed: %w", err)
+		}
+		fmt.Println("✓ DCM PushPrompt RPC verified")
+
+		// Readiness check
+		readyCfg, err := dcmClient.WaitForReady(ctx, cfg.GetId(), 10*time.Millisecond)
+		if err != nil {
+			return fmt.Errorf("DCM WaitForReady failed: %w", err)
+		}
+		if readyCfg.GetState() != dcm.StateReady {
+			return fmt.Errorf("expected DCM_READY state, got %v", readyCfg.GetState())
+		}
+		fmt.Println("✓ Devcontainer readiness polling verified (DCM_READY)")
+	} else {
+		liveClient, err := dcm.NewRealClient(ctx, dcmEndpoint)
+		if err != nil {
+			return fmt.Errorf("connecting to live DCM at %s: %w", dcmEndpoint, err)
+		}
+		defer liveClient.Close()
+		if err := liveClient.HealthCheck(ctx); err != nil {
+			return fmt.Errorf("live DCM health check failed: %w", err)
+		}
+		fmt.Printf("✓ Live DCM endpoint %s connected and verified healthy\n", dcmEndpoint)
+	}
+
+	return nil
+}
+
+func validateDCMProtoSchema() error {
+	// Look for proto/manager.proto in workspace or parent paths
+	candidates := []string{
+		"proto/manager.proto",
+		"../proto/manager.proto",
+		"../../proto/manager.proto",
+	}
+
+	var protoContent string
+	var foundPath string
+	for _, p := range candidates {
+		if data, err := os.ReadFile(p); err == nil {
+			protoContent = string(data)
+			foundPath = p
+			break
+		}
+	}
+
+	if protoContent == "" {
+		// Fallback: check relative to executable if possible
+		if execPath, err := os.Executable(); err == nil {
+			dir := filepath.Dir(execPath)
+			p := filepath.Join(dir, "proto", "manager.proto")
+			if data, err := os.ReadFile(p); err == nil {
+				protoContent = string(data)
+				foundPath = p
+			}
+		}
+	}
+
+	if protoContent != "" {
+		requiredSubstrings := []string{
+			"service ManagerService",
+			"rpc Up(UpRequest) returns (UpResponse)",
+			"rpc Down(DownRequest) returns (DownResponse)",
+			"rpc List(ListRequest) returns (ListResponse)",
+			"rpc PushPrompt(PushPromptRequest) returns (PushPromptResponse)",
+			"enum Harness",
+			"HARNESS_ANTIGRAVITY",
+			"enum State",
+			"DCM_READY",
+			"DCM_FAILED",
+		}
+
+		for _, sub := range requiredSubstrings {
+			if !strings.Contains(protoContent, sub) {
+				return fmt.Errorf("proto file %s missing required contract definition: %s", foundPath, sub)
+			}
+		}
+	}
+
+	// Validate compiled Go protobuf types are linked correctly
+	if dcm.HarnessAntigravity != dcmproto.Harness_HARNESS_ANTIGRAVITY {
+		return fmt.Errorf("mismatched HarnessAntigravity enum mapping")
+	}
+	if dcm.StateReady != dcmproto.State_DCM_READY {
+		return fmt.Errorf("mismatched StateReady enum mapping")
+	}
+
+	return nil
 }

@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package manager;
+
+option go_package = "github.com/brotherlogic/devcontainer-manager/proto";
+
+service ManagerService {
+  rpc Up(UpRequest) returns (UpResponse);
+  rpc Down(DownRequest) returns (DownResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc PushPrompt(PushPromptRequest) returns (PushPromptResponse);
+}
+
+enum State {
+  UNKNOWN_STATE = 0;
+  DCM_RECEIVED = 1;
+  DCM_CREATING = 2;
+  DCM_BRANCHING = 3;
+  DCM_HARNESS = 4;
+  DCM_READY = 5;
+  DCM_FAILED = 6;
+  DCM_HARD_FAILED = 7;
+}
+
+message Identifier {
+  oneof id {
+    int32 issue_number = 1;
+    int32 pr_number = 2;
+  }
+}
+
+enum Harness {
+  HARNESS_UNSPECIFIED = 0;
+  HARNESS_ANTIGRAVITY = 1;
+  HARNESS_PI = 2;
+}
+
+message UpRequest {
+  string repo = 1;
+  Identifier identifier = 2; // e.g., Issue or PR number
+  string branch = 3;
+  string prompt = 4;
+  string model = 5;
+  Harness harness = 6;
+}
+
+message UpResponse {
+  DevcontainerConfig config = 1;
+}
+
+message DownRequest {
+  string id = 1;
+}
+
+message DownResponse {}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated DevcontainerConfig configs = 1;
+}
+
+message PushPromptRequest {
+  string id = 1;
+  string prompt = 2;
+}
+
+message PushPromptResponse {}
+
+enum ExtractionStatus {
+  EXTRACTION_UNSPECIFIED = 0;
+  EXTRACTION_SUCCESS = 1;
+  EXTRACTION_FAILED = 2;
+}
+
+message TokenUsage {
+  int64 total_tokens = 1;
+  ExtractionStatus status = 2;
+  string failure_reason = 3;
+}
+
+message DevcontainerConfig {
+  string id = 1; // Unique identifier for this devcontainer request
+  UpRequest request = 2; // Original request details
+  State state = 3;
+  string error_message = 4;
+  int32 init_retry_count = 5;
+  int64 next_retry_time_unix = 6;
+  TokenUsage token_usage = 7;
+}
