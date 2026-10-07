@@ -115,6 +115,8 @@ type Client interface {
 	CreateIssue(ctx context.Context, req *CreateIssueRequest) (*Issue, error)
 	GetIssue(ctx context.Context, number int) (*Issue, error)
 	CloseIssue(ctx context.Context, number int) error
+	ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error)
+	FindOpenIssueByLabel(ctx context.Context, label string) (*Issue, error)
 
 	// Pull Request management
 	CreatePullRequest(ctx context.Context, req *CreatePRRequest) (*PullRequest, error)

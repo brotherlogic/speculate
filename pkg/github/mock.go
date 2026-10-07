@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -191,6 +192,76 @@ func (m *MockClient) CloseIssue(ctx context.Context, number int) error {
 	}
 	issue.State = "closed"
 	return nil
+}
+
+// ListIssues filters in-memory issues matching state and all requested labels.
+func (m *MockClient) ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	result := make([]*Issue, 0)
+	for i := 1; i < m.nextIssueNum; i++ {
+		iss, exists := m.issues[i]
+		if !exists {
+			continue
+		}
+
+		// State filter
+		// GitHub API default for state is "open". "all" matches any state.
+		if state != "all" {
+			targetState := state
+			if targetState == "" {
+				targetState = "open"
+			}
+			if !strings.EqualFold(iss.State, targetState) {
+				continue
+			}
+		}
+
+		// Label filter: issue must contain ALL requested labels
+		hasAllLabels := true
+		for _, reqLabel := range labels {
+			found := false
+			for _, issLabel := range iss.Labels {
+				if issLabel == reqLabel {
+					found = true
+					break
+				}
+			}
+			if !found {
+				hasAllLabels = false
+				break
+			}
+		}
+		if !hasAllLabels {
+			continue
+		}
+
+		copiedLabels := make([]string, len(iss.Labels))
+		copy(copiedLabels, iss.Labels)
+		result = append(result, &Issue{
+			Number:  iss.Number,
+			Title:   iss.Title,
+			Body:    iss.Body,
+			State:   iss.State,
+			Labels:  copiedLabels,
+			HTMLURL: iss.HTMLURL,
+		})
+	}
+
+	return result, nil
+}
+
+// FindOpenIssueByLabel finds the first open issue with the specified label, or nil if none found.
+func (m *MockClient) FindOpenIssueByLabel(ctx context.Context, label string) (*Issue, error) {
+	issues, err := m.ListIssues(ctx, "open", []string{label})
+	if err != nil {
+		return nil, err
+	}
+	if len(issues) == 0 {
+		return nil, nil
+	}
+	return issues[0], nil
 }
 
 // CreatePullRequest opens a pull request.

@@ -241,6 +241,57 @@ func (c *RealClient) CloseIssue(ctx context.Context, number int) error {
 	return nil
 }
 
+// ListIssues queries existing issues by state and labels.
+func (c *RealClient) ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error) {
+	opts := &github.IssueListByRepoOptions{
+		State:  state,
+		Labels: labels,
+		ListOptions: github.ListOptions{
+			PerPage: 100,
+		},
+	}
+
+	ghIssues, _, err := c.ghClient.Issues.ListByRepo(ctx, c.owner, c.repo, opts)
+	if err != nil {
+		return nil, fmt.Errorf("listing issues: %w", err)
+	}
+
+	issues := make([]*Issue, 0, len(ghIssues))
+	for _, issue := range ghIssues {
+		if issue.PullRequestLinks != nil {
+			continue
+		}
+		var issueLabels []string
+		for _, l := range issue.Labels {
+			if l.Name != nil {
+				issueLabels = append(issueLabels, *l.Name)
+			}
+		}
+		issues = append(issues, &Issue{
+			Number:  issue.GetNumber(),
+			Title:   issue.GetTitle(),
+			Body:    issue.GetBody(),
+			State:   issue.GetState(),
+			Labels:  issueLabels,
+			HTMLURL: issue.GetHTMLURL(),
+		})
+	}
+
+	return issues, nil
+}
+
+// FindOpenIssueByLabel returns the first open issue matching the given label, or nil if none found.
+func (c *RealClient) FindOpenIssueByLabel(ctx context.Context, label string) (*Issue, error) {
+	issues, err := c.ListIssues(ctx, "open", []string{label})
+	if err != nil {
+		return nil, err
+	}
+	if len(issues) == 0 {
+		return nil, nil
+	}
+	return issues[0], nil
+}
+
 // CreatePullRequest opens a pull request.
 func (c *RealClient) CreatePullRequest(ctx context.Context, req *CreatePRRequest) (*PullRequest, error) {
 	prReq := &github.NewPullRequest{
