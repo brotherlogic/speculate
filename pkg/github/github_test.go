@@ -222,7 +222,7 @@ func TestRealClientWithHttpServer(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]string{"message": "Not Found"})
 	})
 
-	// Mock issue creation
+	// Mock issue creation and listing
 	mux.HandleFunc("/repos/brotherlogic/speculate-kv/issues", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var req gh.IssueRequest
@@ -235,6 +235,21 @@ func TestRealClientWithHttpServer(t *testing.T) {
 				HTMLURL: gh.String("https://github.com/brotherlogic/speculate-kv/issues/42"),
 			}
 			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(iss)
+			return
+		}
+		if r.Method == http.MethodGet {
+			iss := []*gh.Issue{
+				{
+					Number:  gh.Int(42),
+					Title:   gh.String("Test Issue"),
+					Body:    gh.String("Body"),
+					State:   gh.String("open"),
+					Labels:  []*gh.Label{{Name: gh.String(LabelAgenticLoop)}},
+					HTMLURL: gh.String("https://github.com/brotherlogic/speculate-kv/issues/42"),
+				},
+			}
+			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(iss)
 			return
 		}
@@ -374,4 +389,274 @@ func TestRealClientWithHttpServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateReadmeBadge failed: %v", err)
 	}
+
+	// Test ListIssues on RealClient
+	issues, err := client.ListIssues(ctx, "open", []string{LabelAgenticLoop})
+	if err != nil {
+		t.Fatalf("RealClient ListIssues failed: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Number != 42 {
+		t.Errorf("expected 1 issue (#42), got %+v", issues)
+	}
+
+	// Test FindOpenIssueByLabel on RealClient
+	foundIssue, err := client.FindOpenIssueByLabel(ctx, LabelAgenticLoop)
+	if err != nil {
+		t.Fatalf("RealClient FindOpenIssueByLabel failed: %v", err)
+	}
+	if foundIssue == nil || foundIssue.Number != 42 {
+		t.Errorf("expected found issue #42, got %+v", foundIssue)
+	}
+}
+
+func TestMockClient_ListIssues(t *testing.T) {
+	ctx := context.Background()
+	client := NewMockClient("brotherlogic", "speculate-kv")
+
+	// 1. Empty states: no issues exist yet
+	t.Run("Empty state - no issues in repository", func(t *testing.T) {
+		issues, err := client.ListIssues(ctx, "open", nil)
+		if err != nil {
+			t.Fatalf("ListIssues failed on empty repo: %v", err)
+		}
+		if len(issues) != 0 {
+			t.Errorf("expected 0 issues on empty repo, got %d", len(issues))
+		}
+
+		issues, err = client.ListIssues(ctx, "", nil)
+		if err != nil {
+			t.Fatalf("ListIssues failed on empty repo with empty state: %v", err)
+		}
+		if len(issues) != 0 {
+			t.Errorf("expected 0 issues, got %d", len(issues))
+		}
+	})
+
+	// Seed issues
+	// Issue 1: Open, labels: ["speculate-agentic-loop", "backend"]
+	iss1, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "Issue 1",
+		Body:   "Body 1",
+		Labels: []string{"speculate-agentic-loop", "backend"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue 1 failed: %v", err)
+	}
+
+	// Issue 2: Open, labels: ["speculate-agentic-loop"]
+	iss2, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "Issue 2",
+		Body:   "Body 2",
+		Labels: []string{"speculate-agentic-loop"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue 2 failed: %v", err)
+	}
+
+	// Issue 3: Closed, labels: ["speculate-agentic-loop", "backend"]
+	iss3, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "Issue 3",
+		Body:   "Body 3",
+		Labels: []string{"speculate-agentic-loop", "backend"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue 3 failed: %v", err)
+	}
+	if err := client.CloseIssue(ctx, iss3.Number); err != nil {
+		t.Fatalf("CloseIssue 3 failed: %v", err)
+	}
+
+	// Issue 4: Closed, labels: ["frontend"]
+	iss4, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "Issue 4",
+		Body:   "Body 4",
+		Labels: []string{"frontend"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue 4 failed: %v", err)
+	}
+	if err := client.CloseIssue(ctx, iss4.Number); err != nil {
+		t.Fatalf("CloseIssue 4 failed: %v", err)
+	}
+
+	// Issue 5: Open, labels: ["frontend"]
+	_, err = client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "Issue 5",
+		Body:   "Body 5",
+		Labels: []string{"frontend"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue 5 failed: %v", err)
+	}
+
+	// 2. Matching labels
+	t.Run("Matching labels", func(t *testing.T) {
+		// Single matching label
+		issues, err := client.ListIssues(ctx, "open", []string{"speculate-agentic-loop"})
+		if err != nil {
+			t.Fatalf("ListIssues failed: %v", err)
+		}
+		if len(issues) != 2 || issues[0].Number != iss1.Number || issues[1].Number != iss2.Number {
+			t.Errorf("expected issues [1, 2], got: %+v", issues)
+		}
+
+		// Multiple matching labels (both required)
+		issues, err = client.ListIssues(ctx, "open", []string{"speculate-agentic-loop", "backend"})
+		if err != nil {
+			t.Fatalf("ListIssues failed: %v", err)
+		}
+		if len(issues) != 1 || issues[0].Number != iss1.Number {
+			t.Errorf("expected issue 1, got: %+v", issues)
+		}
+	})
+
+	// 3. Non-matching labels
+	t.Run("Non-matching labels", func(t *testing.T) {
+		issues, err := client.ListIssues(ctx, "open", []string{"non-existent-label"})
+		if err != nil {
+			t.Fatalf("ListIssues failed: %v", err)
+		}
+		if len(issues) != 0 {
+			t.Errorf("expected 0 issues for non-matching label, got %d", len(issues))
+		}
+
+		// Partial match should not return (must match all requested labels)
+		issues, err = client.ListIssues(ctx, "open", []string{"speculate-agentic-loop", "non-existent-label"})
+		if err != nil {
+			t.Fatalf("ListIssues failed: %v", err)
+		}
+		if len(issues) != 0 {
+			t.Errorf("expected 0 issues for partial match, got %d", len(issues))
+		}
+	})
+
+	// 4. Closed vs open states
+	t.Run("Closed vs open states", func(t *testing.T) {
+		// Open issues with label
+		openIssues, err := client.ListIssues(ctx, "open", []string{"speculate-agentic-loop"})
+		if err != nil {
+			t.Fatalf("ListIssues open failed: %v", err)
+		}
+		if len(openIssues) != 2 {
+			t.Errorf("expected 2 open issues, got %d", len(openIssues))
+		}
+
+		// Closed issues with label
+		closedIssues, err := client.ListIssues(ctx, "closed", []string{"speculate-agentic-loop"})
+		if err != nil {
+			t.Fatalf("ListIssues closed failed: %v", err)
+		}
+		if len(closedIssues) != 1 || closedIssues[0].Number != iss3.Number {
+			t.Errorf("expected closed issue 3, got %+v", closedIssues)
+		}
+
+		// All issues with label
+		allIssues, err := client.ListIssues(ctx, "all", []string{"speculate-agentic-loop"})
+		if err != nil {
+			t.Fatalf("ListIssues all failed: %v", err)
+		}
+		if len(allIssues) != 3 {
+			t.Errorf("expected 3 issues with state 'all', got %d", len(allIssues))
+		}
+	})
+
+	// 5. Empty states (empty label filter, empty state string)
+	t.Run("Empty states filter", func(t *testing.T) {
+		// Empty labels slice returns all open issues
+		openAll, err := client.ListIssues(ctx, "open", nil)
+		if err != nil {
+			t.Fatalf("ListIssues failed: %v", err)
+		}
+		if len(openAll) != 3 { // iss1, iss2, iss5
+			t.Errorf("expected 3 open issues, got %d", len(openAll))
+		}
+
+		// Empty state string defaults to open
+		defaultStateIssues, err := client.ListIssues(ctx, "", nil)
+		if err != nil {
+			t.Fatalf("ListIssues failed with empty state: %v", err)
+		}
+		if len(defaultStateIssues) != 3 {
+			t.Errorf("expected 3 issues for empty state (defaults to open), got %d", len(defaultStateIssues))
+		}
+
+		// All issues across all states with nil labels
+		allStateIssues, err := client.ListIssues(ctx, "all", []string{})
+		if err != nil {
+			t.Fatalf("ListIssues all states failed: %v", err)
+		}
+		if len(allStateIssues) != 5 {
+			t.Errorf("expected 5 issues total, got %d", len(allStateIssues))
+		}
+	})
+}
+
+func TestMockClient_FindOpenIssueByLabel(t *testing.T) {
+	ctx := context.Background()
+	client := NewMockClient("brotherlogic", "speculate-kv")
+
+	// 1. Empty state - no issues
+	t.Run("Empty repository", func(t *testing.T) {
+		found, err := client.FindOpenIssueByLabel(ctx, "speculate-agentic-loop")
+		if err != nil {
+			t.Fatalf("FindOpenIssueByLabel failed: %v", err)
+		}
+		if found != nil {
+			t.Errorf("expected nil found issue, got %+v", found)
+		}
+	})
+
+	// 2. Non-matching label
+	iss1, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "First Open Issue",
+		Body:   "Body",
+		Labels: []string{"speculate-agentic-loop"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	t.Run("Non-matching label", func(t *testing.T) {
+		found, err := client.FindOpenIssueByLabel(ctx, "non-existent")
+		if err != nil {
+			t.Fatalf("FindOpenIssueByLabel failed: %v", err)
+		}
+		if found != nil {
+			t.Errorf("expected nil for non-matching label, got %+v", found)
+		}
+	})
+
+	// 3. Closed issue with label does not match FindOpenIssueByLabel
+	issClosed, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "Closed Issue",
+		Body:   "Body",
+		Labels: []string{"only-closed-label"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+	if err := client.CloseIssue(ctx, issClosed.Number); err != nil {
+		t.Fatalf("CloseIssue failed: %v", err)
+	}
+
+	t.Run("Closed issue with label", func(t *testing.T) {
+		found, err := client.FindOpenIssueByLabel(ctx, "only-closed-label")
+		if err != nil {
+			t.Fatalf("FindOpenIssueByLabel failed: %v", err)
+		}
+		if found != nil {
+			t.Errorf("expected nil for closed issue label, got %+v", found)
+		}
+	})
+
+	// 4. Matching open label returns the open issue
+	t.Run("Matching open issue", func(t *testing.T) {
+		found, err := client.FindOpenIssueByLabel(ctx, "speculate-agentic-loop")
+		if err != nil {
+			t.Fatalf("FindOpenIssueByLabel failed: %v", err)
+		}
+		if found == nil || found.Number != iss1.Number {
+			t.Errorf("expected issue #%d, got %+v", iss1.Number, found)
+		}
+	})
 }
