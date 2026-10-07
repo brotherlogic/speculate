@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package speculate;
+
+option go_package = "github.com/brotherlogic/speculate/proto";
+
+// SpeculateService manages repository enrollment and alignment tracking.
+service SpeculateService {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+// EnrollRequest initiates enrollment of a target repository.
+message EnrollRequest {
+  // repository in "owner/repo" format
+  string repository = 1;
+}
+
+// EnrollResponse represents the result of enrolling a repository.
+message EnrollResponse {
+  string repository = 1;
+  int32 alignment_percentage = 2;
+  string issue_url = 3;
+  string status_message = 4;
+}
+
+// EnrollmentRecord represents the persisted state of an enrolled repository.
+message EnrollmentRecord {
+  string repository = 1;
+  int32 alignment_percentage = 2;
+  string issue_url = 3;
+  int64 enrolled_at_unix = 4;
+  int64 last_evaluated_at_unix = 5;
+  string status_message = 6;
+}
