@@ -14,7 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/brotherlogic/speculate/pkg/enroll"
+	"github.com/brotherlogic/speculate/pkg/evaluator"
+	"github.com/brotherlogic/speculate/pkg/pstore"
 	"github.com/brotherlogic/speculate/pkg/setup"
+	"github.com/brotherlogic/speculate/pkg/synthesizer"
+	pb "github.com/brotherlogic/speculate/proto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -91,6 +96,34 @@ func runDaemon(args []string) {
 	healthServer := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("speculate", grpc_health_v1.HealthCheckResponse_SERVING)
+
+	// Initialize pstore
+	var store pstore.Store
+	if pstoreAddr := os.Getenv("PSTORE_ADDR"); pstoreAddr != "" {
+		pstoreClient, err := pstore.Dial(ctx, pstoreAddr)
+		if err != nil {
+			log.Printf("Warning: failed to connect to pstore at %s: %v; falling back to in-memory store", pstoreAddr, err)
+			store = pstore.NewMockStore()
+		} else {
+			store = pstoreClient
+			defer pstoreClient.Close()
+		}
+	} else {
+		store = pstore.NewMockStore()
+	}
+
+	ghToken := os.Getenv("GH_TOKEN")
+	if ghToken == "" {
+		ghToken = os.Getenv("GITHUB_TOKEN")
+	}
+
+	evalClient := evaluator.NewOllamaClient(cfg.OllamaEndpoint, "")
+	eval := evaluator.NewEvaluator(evalClient)
+	synth := synthesizer.NewSynthesizer(evalClient)
+
+	pipeline := enroll.NewPipeline(ghToken, nil, eval, synth, store)
+	speculateServer := NewSpeculateServer(pipeline)
+	pb.RegisterSpeculateServiceServer(grpcServer, speculateServer)
 
 	go func() {
 		log.Printf("Starting gRPC server on port %d...", cfg.GRPCPort)
@@ -179,11 +212,19 @@ func main() {
 		case "daemon":
 			runDaemon(os.Args[2:])
 			return
+		case "enroll":
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+			if err := runEnroll(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil {
+				os.Exit(1)
+			}
+			return
 		case "help", "-h", "--help":
 			fmt.Println("Usage: speculate <command> [options]")
 			fmt.Println("Commands:")
 			fmt.Println("  init    Initialize a target repository with speculate structure, workflows, and rulesets")
 			fmt.Println("  daemon  Run the speculate orchestrator daemon (default)")
+			fmt.Println("  enroll  Enroll a target repository and dispatch the first scenario card")
 			return
 		}
 	}
