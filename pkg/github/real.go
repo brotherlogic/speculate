@@ -241,6 +241,17 @@ func (c *RealClient) CloseIssue(ctx context.Context, number int) error {
 	return nil
 }
 
+// AddIssueComment posts a comment on an existing GitHub issue.
+func (c *RealClient) AddIssueComment(ctx context.Context, number int, body string) error {
+	_, _, err := c.ghClient.Issues.CreateComment(ctx, c.owner, c.repo, number, &github.IssueComment{
+		Body: github.String(body),
+	})
+	if err != nil {
+		return fmt.Errorf("adding comment to issue #%d: %w", number, err)
+	}
+	return nil
+}
+
 // ListIssues queries existing issues by state and labels.
 func (c *RealClient) ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error) {
 	opts := &github.IssueListByRepoOptions{
