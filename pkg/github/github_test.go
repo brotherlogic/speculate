@@ -660,3 +660,117 @@ func TestMockClient_FindOpenIssueByLabel(t *testing.T) {
 		}
 	})
 }
+
+func TestRequiredLabels_IncludesSeed(t *testing.T) {
+	if LabelSeed != "speculate-seed" {
+		t.Fatalf("expected LabelSeed = %q, got %q", "speculate-seed", LabelSeed)
+	}
+
+	labels := RequiredLabels()
+	var found *Label
+	for i := range labels {
+		if labels[i].Name == LabelSeed {
+			found = &labels[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected RequiredLabels() to include %q, got %+v", LabelSeed, labels)
+	}
+	if found.Color != "1d76db" {
+		t.Errorf("expected LabelSeed color %q, got %q", "1d76db", found.Color)
+	}
+	if found.Description != "Awaiting initial seed protobuf and specification files" {
+		t.Errorf("expected LabelSeed description %q, got %q", "Awaiting initial seed protobuf and specification files", found.Description)
+	}
+}
+
+func TestMockClient_IssueComments(t *testing.T) {
+	ctx := context.Background()
+	client := NewMockClient("brotherlogic", "speculate-kv")
+
+	// Commenting on a non-existent issue should return an error
+	if err := client.AddIssueComment(ctx, 999, "comment on missing issue"); err == nil {
+		t.Fatalf("expected error when commenting on non-existent issue #999, got nil")
+	}
+
+	iss, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "[Speculate] Add initial seed proto and spec files",
+		Body:   "Please add seed files.",
+		Labels: []string{LabelSeed},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+
+	if got := client.GetIssueComments(iss.Number); len(got) != 0 {
+		t.Fatalf("expected 0 initial comments, got %v", got)
+	}
+
+	comment1 := "First comment on seed issue"
+	comment2 := "Seed protobuf and specification files detected on `main`."
+	if err := client.AddIssueComment(ctx, iss.Number, comment1); err != nil {
+		t.Fatalf("AddIssueComment 1 failed: %v", err)
+	}
+	if err := client.AddIssueComment(ctx, iss.Number, comment2); err != nil {
+		t.Fatalf("AddIssueComment 2 failed: %v", err)
+	}
+
+	comments := client.GetIssueComments(iss.Number)
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d (%v)", len(comments), comments)
+	}
+	if comments[0] != comment1 || comments[1] != comment2 {
+		t.Errorf("unexpected comments: got %v, want [%q, %q]", comments, comment1, comment2)
+	}
+
+	// Verify returned slice is a defensive copy
+	comments[0] = "mutated"
+	again := client.GetIssueComments(iss.Number)
+	if again[0] != comment1 {
+		t.Errorf("expected GetIssueComments to return a copy, but internal slice was mutated: %v", again)
+	}
+}
+
+func TestRealClient_AddIssueComment(t *testing.T) {
+	mux := http.NewServeMux()
+
+	var receivedBody string
+	var requestCount int
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/issues/42/comments", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		requestCount++
+		var comment gh.IssueComment
+		if err := json.NewDecoder(r.Body).Decode(&comment); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		receivedBody = comment.GetBody()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(&gh.IssueComment{
+			ID:   gh.Int64(1001),
+			Body: comment.Body,
+		})
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewRealClient("fake-token", "brotherlogic", "speculate-kv", WithBaseURL(server.URL))
+	ctx := context.Background()
+
+	expectedComment := "Closing seed issue after detecting seed files."
+	if err := client.AddIssueComment(ctx, 42, expectedComment); err != nil {
+		t.Fatalf("RealClient.AddIssueComment failed: %v", err)
+	}
+	if requestCount != 1 {
+		t.Errorf("expected 1 POST request to comments endpoint, got %d", requestCount)
+	}
+	if receivedBody != expectedComment {
+		t.Errorf("expected comment body %q, got %q", expectedComment, receivedBody)
+	}
+}
+

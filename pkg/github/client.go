@@ -12,6 +12,7 @@ const (
 	LabelAgenticLoop = "speculate-agentic-loop"
 	LabelAlign       = "speculate-align"
 	LabelStalled     = "speculate-stalled"
+	LabelSeed        = "speculate-seed"
 )
 
 // Branch represents a Git branch reference.
@@ -44,6 +45,11 @@ func RequiredLabels() []Label {
 			Name:        LabelStalled,
 			Color:       "d93f0b",
 			Description: "Agentic alignment stalled; human attention required",
+		},
+		{
+			Name:        LabelSeed,
+			Color:       "1d76db",
+			Description: "Awaiting initial seed protobuf and specification files",
 		},
 	}
 }
@@ -115,6 +121,7 @@ type Client interface {
 	CreateIssue(ctx context.Context, req *CreateIssueRequest) (*Issue, error)
 	GetIssue(ctx context.Context, number int) (*Issue, error)
 	CloseIssue(ctx context.Context, number int) error
+	AddIssueComment(ctx context.Context, number int, body string) error
 	ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error)
 	FindOpenIssueByLabel(ctx context.Context, label string) (*Issue, error)
 

@@ -11,30 +11,32 @@ import (
 
 // MockClient provides an in-memory implementation of the GitHub Client interface.
 type MockClient struct {
-	mu           sync.RWMutex
-	owner        string
-	repo         string
-	branches     map[string]string                 // branchName -> commitSHA
-	labels       map[string]Label                  // labelName -> Label
-	issues       map[int]*Issue                    // number -> Issue
-	prs          map[int]*PullRequest              // number -> PullRequest
-	files        map[string]map[string]*FileContent // ref -> path -> FileContent
-	nextIssueNum int
-	nextPRNum    int
+	mu            sync.RWMutex
+	owner         string
+	repo          string
+	branches      map[string]string                 // branchName -> commitSHA
+	labels        map[string]Label                  // labelName -> Label
+	issues        map[int]*Issue                    // number -> Issue
+	issueComments map[int][]string                  // number -> comment bodies
+	prs           map[int]*PullRequest              // number -> PullRequest
+	files         map[string]map[string]*FileContent // ref -> path -> FileContent
+	nextIssueNum  int
+	nextPRNum     int
 }
 
 // NewMockClient initializes a thread-safe MockClient.
 func NewMockClient(owner, repo string) *MockClient {
 	m := &MockClient{
-		owner:        owner,
-		repo:         repo,
-		branches:     make(map[string]string),
-		labels:       make(map[string]Label),
-		issues:       make(map[int]*Issue),
-		prs:          make(map[int]*PullRequest),
-		files:        make(map[string]map[string]*FileContent),
-		nextIssueNum: 1,
-		nextPRNum:    1,
+		owner:         owner,
+		repo:          repo,
+		branches:      make(map[string]string),
+		labels:        make(map[string]Label),
+		issues:        make(map[int]*Issue),
+		issueComments: make(map[int][]string),
+		prs:           make(map[int]*PullRequest),
+		files:         make(map[string]map[string]*FileContent),
+		nextIssueNum:  1,
+		nextPRNum:     1,
 	}
 
 	// Seed with default main branch
@@ -192,6 +194,29 @@ func (m *MockClient) CloseIssue(ctx context.Context, number int) error {
 	}
 	issue.State = "closed"
 	return nil
+}
+
+// AddIssueComment records a comment on an existing issue in memory.
+func (m *MockClient) AddIssueComment(ctx context.Context, number int, body string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.issues[number]; !ok {
+		return fmt.Errorf("issue #%d not found", number)
+	}
+	m.issueComments[number] = append(m.issueComments[number], body)
+	return nil
+}
+
+// GetIssueComments returns a copy of the recorded comments for the given issue number.
+func (m *MockClient) GetIssueComments(number int) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	comments := m.issueComments[number]
+	copied := make([]string, len(comments))
+	copy(copied, comments)
+	return copied
 }
 
 // ListIssues filters in-memory issues matching state and all requested labels.
