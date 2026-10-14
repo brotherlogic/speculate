@@ -3,6 +3,7 @@ package enroll
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,7 +106,33 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 		return nil, fmt.Errorf("cloning repository %s: %w", canonicalRepo, err)
 	}
 
-	// 3. Verify specs/ directory exists and parse spec files with parser.ParseSpecFile
+	// 3a. Verify seed .proto presence in proto/
+	protoDir := filepath.Join(tempDir, "proto")
+	hasProto := false
+	_ = filepath.WalkDir(protoDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != protoDir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") || !strings.HasSuffix(d.Name(), ".proto") {
+			return nil
+		}
+		info, err := d.Info()
+		if err == nil && info.Size() > 0 {
+			hasProto = true
+		}
+		return nil
+	})
+	if !hasProto {
+		return nil, status.Errorf(codes.InvalidArgument, "no valid seed .proto files found in proto/ for %s", canonicalRepo)
+	}
+
+	// 3b. Verify specs/ directory exists and parse spec files with parser.ParseSpecFile
 	specsDir := filepath.Join(tempDir, "specs")
 	specEntries, err := os.ReadDir(specsDir)
 	if err != nil {
@@ -117,7 +144,11 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 
 	var combinedSpec *parser.Specification
 	for _, entry := range specEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.Size() == 0 {
 			continue
 		}
 		specFilePath := filepath.Join(specsDir, entry.Name())
@@ -136,6 +167,22 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 		return nil, status.Errorf(codes.InvalidArgument, "no valid specification files found in specs/ for %s", canonicalRepo)
 	}
 
+	// 3c. Auto-close open speculate-seed issue when seed files are verified
+	gh := p.githubClientFactory(p.token, owner, repoName)
+	seedIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelSeed)
+	if err != nil {
+		return nil, fmt.Errorf("checking for open seed issue: %w", err)
+	}
+	if seedIssue != nil {
+		commentBody := "Seed protobuf and specification files detected on `main`. Closing this tracking issue and initiating the Speculate autonomous alignment loop."
+		if err := gh.AddIssueComment(ctx, seedIssue.Number, commentBody); err != nil {
+			return nil, fmt.Errorf("commenting on seed issue #%d: %w", seedIssue.Number, err)
+		}
+		if err := gh.CloseIssue(ctx, seedIssue.Number); err != nil {
+			return nil, fmt.Errorf("closing seed issue #%d: %w", seedIssue.Number, err)
+		}
+	}
+
 	// 4. Parse test scenarios from tests/ using parser.ParseTestDir
 	testsDir := filepath.Join(tempDir, "tests")
 	suite, err := parser.ParseTestDir(testsDir)
@@ -148,8 +195,6 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 	if err != nil {
 		return nil, fmt.Errorf("evaluating alignment: %w", err)
 	}
-
-	gh := p.githubClientFactory(p.token, owner, repoName)
 
 	// 6. Ensure required labels exist on the repository using ghClient.EnsureLabels
 	if err := gh.EnsureLabels(ctx, ghclient.RequiredLabels()); err != nil {
