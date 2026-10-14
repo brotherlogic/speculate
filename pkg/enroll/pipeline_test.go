@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/brotherlogic/speculate/pkg/evaluator"
@@ -16,9 +17,29 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const sampleProto = `syntax = "proto3";
+package kv.v1;
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+}
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+}
+message PutResponse {}
+`
+
 func createTestRepoFS(t *testing.T, specContent string, testContent string) string {
 	t.Helper()
 	dir := t.TempDir()
+
+	protoDir := filepath.Join(dir, "proto")
+	if err := os.MkdirAll(protoDir, 0755); err != nil {
+		t.Fatalf("failed to create proto dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(protoDir, "kv.proto"), []byte(sampleProto), 0644); err != nil {
+		t.Fatalf("failed to write proto: %v", err)
+	}
 
 	if specContent != "" {
 		specsDir := filepath.Join(dir, "specs")
@@ -306,6 +327,189 @@ func TestEnroll_InvalidRepo(t *testing.T) {
 	st, ok := status.FromError(err)
 	if !ok || st.Code() != codes.InvalidArgument {
 		t.Errorf("expected codes.InvalidArgument, got %v (err: %v)", st.Code(), err)
+	}
+}
+
+func TestEnroll_MissingProtoFiles(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) string
+	}{
+		{
+			name: "missing proto directory",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				specsDir := filepath.Join(dir, "specs")
+				if err := os.MkdirAll(specsDir, 0755); err != nil {
+					t.Fatalf("failed to create specs dir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(specsDir, "spec.md"), []byte(sampleSpec), 0644); err != nil {
+					t.Fatalf("failed to write spec: %v", err)
+				}
+				return dir
+			},
+		},
+		{
+			name: "proto directory with only gitkeep and zero-byte proto",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				protoDir := filepath.Join(dir, "proto")
+				if err := os.MkdirAll(protoDir, 0755); err != nil {
+					t.Fatalf("failed to create proto dir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(protoDir, ".gitkeep"), []byte("placeholder"), 0644); err != nil {
+					t.Fatalf("failed to write .gitkeep: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(protoDir, ".hidden.proto"), []byte(sampleProto), 0644); err != nil {
+					t.Fatalf("failed to write hidden proto: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(protoDir, "empty.proto"), []byte(""), 0644); err != nil {
+					t.Fatalf("failed to write empty proto: %v", err)
+				}
+				specsDir := filepath.Join(dir, "specs")
+				if err := os.MkdirAll(specsDir, 0755); err != nil {
+					t.Fatalf("failed to create specs dir: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(specsDir, "spec.md"), []byte(sampleSpec), 0644); err != nil {
+					t.Fatalf("failed to write spec: %v", err)
+				}
+				return dir
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repoDir := tc.setup(t)
+			mockGH := ghclient.NewMockClient("brotherlogic", "speculate-kv")
+			mockStore := pstore.NewMockStore()
+
+			seedIssue, err := mockGH.CreateIssue(ctx, &ghclient.CreateIssueRequest{
+				Title:  "[Speculate] Add initial seed proto and spec files",
+				Body:   "Please add seed files",
+				Labels: []string{ghclient.LabelSeed},
+			})
+			if err != nil {
+				t.Fatalf("failed to pre-create seed issue: %v", err)
+			}
+
+			pipeline := NewPipeline(
+				"test-token",
+				func(token, owner, repo string) ghclient.Client {
+					return mockGH
+				},
+				evaluator.NewEvaluator(nil),
+				synthesizer.NewSynthesizer(nil),
+				mockStore,
+			)
+			pipeline.cloneFn = func(ctx context.Context, repoURL, targetDir string) error {
+				return copyDir(repoDir, targetDir)
+			}
+
+			_, err = pipeline.Enroll(ctx, "brotherlogic/speculate-kv")
+			if err == nil {
+				t.Fatal("expected error for missing valid proto files, got nil")
+			}
+
+			st, ok := status.FromError(err)
+			if !ok || st.Code() != codes.InvalidArgument {
+				t.Errorf("expected codes.InvalidArgument, got status code %v (err: %v)", st.Code(), err)
+			}
+
+			// Verify pre-existing open speculate-seed issue remains open
+			iss, err := mockGH.GetIssue(ctx, seedIssue.Number)
+			if err != nil {
+				t.Fatalf("failed to get seed issue: %v", err)
+			}
+			if iss.State != "open" {
+				t.Errorf("expected seed issue to remain open, got state %q", iss.State)
+			}
+		})
+	}
+}
+
+func TestEnroll_AutoClosesSeedIssue(t *testing.T) {
+	ctx := context.Background()
+	repoDir := createTestRepoFS(t, sampleSpec, "")
+
+	mockGH := ghclient.NewMockClient("brotherlogic", "speculate-kv")
+	mockStore := pstore.NewMockStore()
+
+	// Pre-create an open issue with ghclient.LabelSeed on MockClient
+	seedIssue, err := mockGH.CreateIssue(ctx, &ghclient.CreateIssueRequest{
+		Title:  "[Speculate] Add initial seed proto and spec files",
+		Body:   "Please add seed files",
+		Labels: []string{ghclient.LabelSeed},
+	})
+	if err != nil {
+		t.Fatalf("failed to pre-create seed issue: %v", err)
+	}
+
+	synthLLM := &evaluator.MockLLMClient{
+		Response: `{
+			"id": "Core-1",
+			"stage": "Core",
+			"requirement": "Put stores key",
+			"target_rpc": "Put",
+			"title": "Put stores key",
+			"given": "Empty store",
+			"when": "Put is called",
+			"then": "Value is stored",
+			"test_func_name": "TestPut_Basic"
+		}`,
+	}
+	eval := evaluator.NewEvaluator(synthLLM)
+	synth := synthesizer.NewSynthesizer(synthLLM)
+
+	pipeline := NewPipeline(
+		"test-token",
+		func(token, owner, repo string) ghclient.Client {
+			return mockGH
+		},
+		eval,
+		synth,
+		mockStore,
+	)
+	pipeline.cloneFn = func(ctx context.Context, repoURL, targetDir string) error {
+		return copyDir(repoDir, targetDir)
+	}
+
+	resp, err := pipeline.Enroll(ctx, "brotherlogic/speculate-kv")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify closure comment on seed issue
+	comments := mockGH.GetIssueComments(seedIssue.Number)
+	if len(comments) == 0 {
+		t.Fatalf("expected closure comment on seed issue #%d, got 0 comments", seedIssue.Number)
+	}
+	expectedComment := "Seed protobuf and specification files detected on `main`. Closing this tracking issue and initiating the Speculate autonomous alignment loop."
+	if !strings.Contains(comments[0], expectedComment) {
+		t.Errorf("expected comment %q, got %q", expectedComment, comments[0])
+	}
+
+	// Verify seed issue state is closed
+	closedSeed, err := mockGH.GetIssue(ctx, seedIssue.Number)
+	if err != nil {
+		t.Fatalf("failed to get seed issue: %v", err)
+	}
+	if closedSeed.State != "closed" {
+		t.Errorf("expected seed issue state 'closed', got %q", closedSeed.State)
+	}
+
+	// Verify speculate-agentic-loop scenario card issue is created and returned in EnrollResponse.IssueUrl
+	loopIssues, err := mockGH.ListIssues(ctx, "open", []string{ghclient.LabelAgenticLoop})
+	if err != nil {
+		t.Fatalf("failed to list agentic loop issues: %v", err)
+	}
+	if len(loopIssues) != 1 {
+		t.Fatalf("expected 1 open issue with label %s, got %d", ghclient.LabelAgenticLoop, len(loopIssues))
+	}
+	if resp.GetIssueUrl() == "" || resp.GetIssueUrl() != loopIssues[0].HTMLURL {
+		t.Errorf("expected EnrollResponse.IssueUrl %q to match created loop issue %q", resp.GetIssueUrl(), loopIssues[0].HTMLURL)
 	}
 }
 

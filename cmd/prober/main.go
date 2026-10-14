@@ -843,6 +843,14 @@ func runEnrollProber(ctx context.Context, targetRepo string, dryRun bool, token 
 				return nil
 			}
 
+			protoDir := filepath.Join(targetDir, "proto")
+			if err := os.MkdirAll(protoDir, 0755); err != nil {
+				return err
+			}
+			protoContent := "syntax = \"proto3\";\npackage kv.v1;\nservice KV {\n  rpc Put(PutRequest) returns (PutResponse);\n}\nmessage PutRequest {\n  string key = 1;\n  bytes value = 2;\n}\nmessage PutResponse {}\n"
+			if err := os.WriteFile(filepath.Join(protoDir, "kv.proto"), []byte(protoContent), 0644); err != nil {
+				return err
+			}
 			specsDir := filepath.Join(targetDir, "specs")
 			if err := os.MkdirAll(specsDir, 0755); err != nil {
 				return err
