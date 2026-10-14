@@ -45,6 +45,18 @@ type Config struct {
 	EnsureGoModuleFunc          func(ctx context.Context, cfg *Config) error
 	EnsurePassingTestsFunc      func(cfg *Config) error
 	VerifyLocalTestsFunc        func(ctx context.Context, cfg *Config) error
+	EnsureSeedIssueFunc         func(ctx context.Context, cfg *Config, status SeedStatus) (string, error)
+}
+
+// SeedStatus tracks whether non-empty seed protobuf and specification files exist.
+type SeedStatus struct {
+	HasProto bool
+	HasSpec  bool
+}
+
+// Ready returns true when both a seed protobuf file and a seed specification file are present.
+func (s SeedStatus) Ready() bool {
+	return s.HasProto && s.HasSpec
 }
 
 // RepoPermissions captures repository access permissions from GitHub API.
@@ -1062,6 +1074,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 	if !hasChanges {
 		fmt.Println("✓ Repository scaffolding is already up to date (no changes detected)")
+		finalizeSeedCheck(ctx, cfg)
 		fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)
 		return nil
 	}
@@ -1076,6 +1089,7 @@ func Run(ctx context.Context, cfg *Config) error {
 			}
 			fmt.Println("✓ Ruleset 'main' enforced (CODEOWNERS review, required checks, squash merge)")
 		}
+		finalizeSeedCheck(ctx, cfg)
 		fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)
 		return nil
 	}
@@ -1136,6 +1150,149 @@ func Run(ctx context.Context, cfg *Config) error {
 		fmt.Printf("    Current token has push=%v, admin=%v. Run 'speculate init --token=<admin-token>' as repository owner to apply rulesets.\n", perms.Push, perms.Admin)
 	}
 
+	finalizeSeedCheck(ctx, cfg)
 	fmt.Printf("\n🎉 Repository %s initialization completed!\n", cfg.Repo)
 	return nil
+}
+
+func hasNonEmptyFileWithExt(dir, ext string) (bool, error) {
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	found := false
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if path != dir && strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ext) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() > 0 {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found, err
+}
+
+// CheckSeedFiles inspects proto/ and specs/ for non-empty .proto and .md seed files.
+func CheckSeedFiles(rootDir string) (SeedStatus, error) {
+	if rootDir == "" {
+		rootDir = "."
+	}
+	hasProto, err := hasNonEmptyFileWithExt(filepath.Join(rootDir, "proto"), ".proto")
+	if err != nil {
+		return SeedStatus{}, fmt.Errorf("checking seed proto files: %w", err)
+	}
+	hasSpec, err := hasNonEmptyFileWithExt(filepath.Join(rootDir, "specs"), ".md")
+	if err != nil {
+		return SeedStatus{}, fmt.Errorf("checking seed spec files: %w", err)
+	}
+	return SeedStatus{
+		HasProto: hasProto,
+		HasSpec:  hasSpec,
+	}, nil
+}
+
+// EnsureSeedIssue ensures the speculate-seed label exists and returns an existing or newly created seed tracking issue URL.
+func EnsureSeedIssue(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+	if cfg.EnsureSeedIssueFunc != nil {
+		return cfg.EnsureSeedIssueFunc(ctx, cfg, status)
+	}
+
+	labelCmd := ghCmd(ctx, cfg, "label", "create", SeedIssueLabel, "--repo", cfg.Repo, "--color", "1d76db", "--description", "Awaiting initial seed protobuf and specification files", "--force")
+	if out, err := labelCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("gh label create failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	listCmd := ghCmd(ctx, cfg, "issue", "list", "--repo", cfg.Repo, "--label", SeedIssueLabel, "--state", "open", "--json", "url", "--jq", ".[0].url")
+	listOut, err := listCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh issue list failed: %s: %w", strings.TrimSpace(string(listOut)), err)
+	}
+
+	existingURL := strings.TrimSpace(string(listOut))
+	if existingURL != "" && existingURL != "null" {
+		for _, line := range strings.Split(existingURL, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+				existingURL = trimmed
+				break
+			}
+		}
+		log.Printf("Existing open seed tracking issue detected: %s", existingURL)
+		return existingURL, nil
+	}
+
+	createCmd := ghCmd(ctx, cfg, "issue", "create", "--repo", cfg.Repo, "--title", SeedIssueTitle, "--label", SeedIssueLabel, "--body", RenderSeedIssueBody(status.HasProto, status.HasSpec))
+	out, err := createCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh issue create failed: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var issueURL string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+			issueURL = trimmed
+			break
+		}
+	}
+	if issueURL == "" {
+		issueURL = strings.TrimSpace(string(out))
+	}
+	if issueURL == "" {
+		return "", errors.New("gh issue create returned empty URL")
+	}
+
+	return issueURL, nil
+}
+
+func finalizeSeedCheck(ctx context.Context, cfg *Config) {
+	status, err := CheckSeedFiles(cfg.RootDir)
+	if err != nil {
+		fmt.Printf("⚠️  Warning: could not check seed files: %v\n", err)
+		return
+	}
+	if status.Ready() {
+		fmt.Println("✓ Seed proto and spec files detected")
+		return
+	}
+
+	var issueURL string
+	if !(cfg.SkipPush && cfg.Repo == "") {
+		url, err := EnsureSeedIssue(ctx, cfg, status)
+		if err != nil {
+			fmt.Printf("⚠️  Warning: could not file seed tracking issue: %v\n", err)
+		} else {
+			issueURL = url
+		}
+	}
+
+	fmt.Println("\n📋 Next Steps: Seed Files Required")
+	fmt.Println("   Please add your initial seed proto (proto/*.proto) and specification (specs/*.md)")
+	fmt.Println("   files and commit them to the repository (main branch) to begin the alignment loop.")
+	if issueURL != "" {
+		fmt.Printf("   Tracking Issue: %s\n", issueURL)
+	}
 }

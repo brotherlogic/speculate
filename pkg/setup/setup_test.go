@@ -236,6 +236,9 @@ func TestRun_SuccessWithPRWorkflow(t *testing.T) {
 			executionOrder = append(executionOrder, "configure_rulesets")
 			return nil
 		},
+		EnsureSeedIssueFunc: func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			return "https://github.com/brotherlogic/test-repo/issues/1", nil
+		},
 	}
 
 	if err := Run(context.Background(), cfg); err != nil {
@@ -317,6 +320,9 @@ func TestRun_IdempotentCleanTree_NoOp(t *testing.T) {
 		},
 		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
+		},
+		EnsureSeedIssueFunc: func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			return "https://github.com/brotherlogic/test-repo/issues/1", nil
 		},
 	}
 
@@ -514,6 +520,9 @@ func TestRun_FullScaffoldingE2E(t *testing.T) {
 		ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
 			executionOrder = append(executionOrder, "configure_rulesets")
 			return nil
+		},
+		EnsureSeedIssueFunc: func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			return "https://github.com/brotherlogic/test-repo/issues/1", nil
 		},
 	}
 
@@ -2246,3 +2255,397 @@ func TestVerifyLocalTests_HookInvocation(t *testing.T) {
 		t.Fatalf("expected error %v, got %v", expectedErr, err)
 	}
 }
+
+func TestCheckSeedFiles(t *testing.T) {
+	t.Run("missing directories", func(t *testing.T) {
+		tempDir := t.TempDir()
+		status, err := CheckSeedFiles(tempDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.HasProto || status.HasSpec || status.Ready() {
+			t.Errorf("expected HasProto=false, HasSpec=false, Ready()=false, got %+v", status)
+		}
+	})
+
+	t.Run("empty directories or only .gitkeep and 0-byte files", func(t *testing.T) {
+		tempDir := t.TempDir()
+		cfg := &Config{RootDir: tempDir}
+		if err := SetupDirectories(cfg); err != nil {
+			t.Fatalf("SetupDirectories failed: %v", err)
+		}
+		// Add 0-byte .proto and .md files and hidden files
+		_ = os.WriteFile(filepath.Join(tempDir, "proto", "empty.proto"), []byte(""), 0644)
+		_ = os.WriteFile(filepath.Join(tempDir, "proto", ".hidden.proto"), []byte("syntax = \"proto3\";"), 0644)
+		_ = os.WriteFile(filepath.Join(tempDir, "specs", "empty.md"), []byte(""), 0644)
+		_ = os.WriteFile(filepath.Join(tempDir, "specs", ".hidden.md"), []byte("# Spec"), 0644)
+
+		status, err := CheckSeedFiles(tempDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.HasProto || status.HasSpec || status.Ready() {
+			t.Errorf("expected HasProto=false, HasSpec=false, Ready()=false, got %+v", status)
+		}
+	})
+
+	t.Run("only proto file > 0 bytes", func(t *testing.T) {
+		tempDir := t.TempDir()
+		protoDir := filepath.Join(tempDir, "proto")
+		_ = os.MkdirAll(protoDir, 0755)
+		_ = os.WriteFile(filepath.Join(protoDir, "service.proto"), []byte("syntax = \"proto3\";\n"), 0644)
+
+		status, err := CheckSeedFiles(tempDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !status.HasProto || status.HasSpec || status.Ready() {
+			t.Errorf("expected HasProto=true, HasSpec=false, Ready()=false, got %+v", status)
+		}
+	})
+
+	t.Run("only spec file > 0 bytes", func(t *testing.T) {
+		tempDir := t.TempDir()
+		specsDir := filepath.Join(tempDir, "specs")
+		_ = os.MkdirAll(specsDir, 0755)
+		_ = os.WriteFile(filepath.Join(specsDir, "spec.md"), []byte("# Spec\n"), 0644)
+
+		status, err := CheckSeedFiles(tempDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status.HasProto || !status.HasSpec || status.Ready() {
+			t.Errorf("expected HasProto=false, HasSpec=true, Ready()=false, got %+v", status)
+		}
+	})
+
+	t.Run("nested proto and spec files > 0 bytes", func(t *testing.T) {
+		tempDir := t.TempDir()
+		nestedProtoDir := filepath.Join(tempDir, "proto", "kv", "v1")
+		specsDir := filepath.Join(tempDir, "specs")
+		_ = os.MkdirAll(nestedProtoDir, 0755)
+		_ = os.MkdirAll(specsDir, 0755)
+		_ = os.WriteFile(filepath.Join(nestedProtoDir, "kv.proto"), []byte("syntax = \"proto3\";\n"), 0644)
+		_ = os.WriteFile(filepath.Join(specsDir, "kv.md"), []byte("# KV Spec [Stage: 1]\n"), 0644)
+
+		status, err := CheckSeedFiles(tempDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !status.HasProto || !status.HasSpec || !status.Ready() {
+			t.Errorf("expected HasProto=true, HasSpec=true, Ready()=true, got %+v", status)
+		}
+	})
+}
+
+func TestRenderSeedIssueBody(t *testing.T) {
+	if SeedIssueTitle != "[Speculate] Add initial seed proto and spec files" {
+		t.Errorf("unexpected SeedIssueTitle: %q", SeedIssueTitle)
+	}
+	if SeedIssueLabel != "speculate-seed" {
+		t.Errorf("unexpected SeedIssueLabel: %q", SeedIssueLabel)
+	}
+
+	t.Run("neither present", func(t *testing.T) {
+		body := RenderSeedIssueBody(false, false)
+		if !strings.Contains(body, "- [ ] `proto/*.proto`") {
+			t.Errorf("expected unchecked proto item in body:\n%s", body)
+		}
+		if !strings.Contains(body, "- [ ] `specs/*.md`") {
+			t.Errorf("expected unchecked spec item in body:\n%s", body)
+		}
+		if !strings.Contains(body, "main") {
+			t.Errorf("expected body to mention committing to main:\n%s", body)
+		}
+	})
+
+	t.Run("only proto present", func(t *testing.T) {
+		body := RenderSeedIssueBody(true, false)
+		if !strings.Contains(body, "- [x] `proto/*.proto`") {
+			t.Errorf("expected checked proto item in body:\n%s", body)
+		}
+		if !strings.Contains(body, "- [ ] `specs/*.md`") {
+			t.Errorf("expected unchecked spec item in body:\n%s", body)
+		}
+	})
+
+	t.Run("only spec present", func(t *testing.T) {
+		body := RenderSeedIssueBody(false, true)
+		if !strings.Contains(body, "- [ ] `proto/*.proto`") {
+			t.Errorf("expected unchecked proto item in body:\n%s", body)
+		}
+		if !strings.Contains(body, "- [x] `specs/*.md`") {
+			t.Errorf("expected checked spec item in body:\n%s", body)
+		}
+	})
+}
+
+func TestEnsureSeedIssue(t *testing.T) {
+	t.Run("creates new issue when none open", func(t *testing.T) {
+		script := `
+if [ "$1" = "label" ] && [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo ""
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "create" ]; then
+  echo "https://github.com/brotherlogic/test-repo/issues/10"
+  exit 0
+fi
+`
+		_, logFile := setupMockGH(t, script)
+		cfg := &Config{
+			RootDir: t.TempDir(),
+			Repo:    "brotherlogic/test-repo",
+		}
+		url, err := EnsureSeedIssue(context.Background(), cfg, SeedStatus{HasProto: false, HasSpec: false})
+		if err != nil {
+			t.Fatalf("EnsureSeedIssue failed: %v", err)
+		}
+		if url != "https://github.com/brotherlogic/test-repo/issues/10" {
+			t.Errorf("expected created issue URL, got %q", url)
+		}
+		loggedBytes, _ := os.ReadFile(logFile)
+		logged := string(loggedBytes)
+		if !strings.Contains(logged, "label create speculate-seed") {
+			t.Errorf("expected label create command, got:\n%s", logged)
+		}
+		if !strings.Contains(logged, "issue list --repo brotherlogic/test-repo --label speculate-seed --state open") {
+			t.Errorf("expected issue list command, got:\n%s", logged)
+		}
+		if !strings.Contains(logged, "issue create --repo brotherlogic/test-repo --title [Speculate] Add initial seed proto and spec files --label speculate-seed") {
+			t.Errorf("expected issue create command, got:\n%s", logged)
+		}
+	})
+
+	t.Run("reuses existing open issue", func(t *testing.T) {
+		script := `
+if [ "$1" = "label" ] && [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo "https://github.com/brotherlogic/test-repo/issues/7"
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "create" ]; then
+  echo "SHOULD NOT BE CALLED" >&2
+  exit 1
+fi
+`
+		setupMockGH(t, script)
+		cfg := &Config{
+			RootDir: t.TempDir(),
+			Repo:    "brotherlogic/test-repo",
+		}
+		url, err := EnsureSeedIssue(context.Background(), cfg, SeedStatus{HasProto: true, HasSpec: false})
+		if err != nil {
+			t.Fatalf("EnsureSeedIssue failed: %v", err)
+		}
+		if url != "https://github.com/brotherlogic/test-repo/issues/7" {
+			t.Errorf("expected existing issue URL, got %q", url)
+		}
+	})
+}
+
+func TestRun_SeedIssueLifecycle(t *testing.T) {
+	newBaseConfig := func(tempDir string) *Config {
+		return &Config{
+			RootDir:      tempDir,
+			Repo:         "brotherlogic/test-repo",
+			Collaborator: "brotherlogic-automation",
+			Force:        true,
+			CheckToolchainFunc: func(ctx context.Context) error {
+				return nil
+			},
+			EnsureGoModuleFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
+			EnsurePassingTestsFunc: func(cfg *Config) error {
+				return nil
+			},
+			VerifyLocalTestsFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
+			CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+				return RepoPermissions{Admin: true, Push: true}, nil
+			},
+			ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
+			ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
+			CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+				return nil
+			},
+			CreatePRFunc: func(ctx context.Context, cfg *Config, branchName, title, body string) (string, error) {
+				return "https://github.com/brotherlogic/test-repo/pull/42", nil
+			},
+			EnableAutoMergeFunc: func(ctx context.Context, cfg *Config, prURL string) error {
+				return nil
+			},
+			PollPRStatusFunc: func(ctx context.Context, cfg *Config, prURL string, timeout time.Duration) error {
+				return nil
+			},
+			SyncMainBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+				return nil
+			},
+			ConfigureRulesetsFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
+		}
+	}
+
+	captureStdout := func(t *testing.T, fn func()) string {
+		t.Helper()
+		origStdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe failed: %v", err)
+		}
+		os.Stdout = w
+		defer func() {
+			os.Stdout = origStdout
+		}()
+
+		fn()
+
+		_ = w.Close()
+		outBytes, err := os.ReadFile("/dev/fd/0")
+		_ = outBytes
+		var buf strings.Builder
+		tmp := make([]byte, 1024)
+		for {
+			n, readErr := r.Read(tmp)
+			if n > 0 {
+				buf.Write(tmp[:n])
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		_ = r.Close()
+		return buf.String()
+	}
+
+	t.Run("missing seed files on initial scaffolding invokes EnsureSeedIssueFunc and prints instructions", func(t *testing.T) {
+		tempDir := t.TempDir()
+		cfg := newBaseConfig(tempDir)
+		cfg.CheckScaffoldingChangesFunc = func(ctx context.Context, cfg *Config) (bool, error) {
+			return true, nil
+		}
+
+		ensureCalled := false
+		var capturedStatus SeedStatus
+		cfg.EnsureSeedIssueFunc = func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			ensureCalled = true
+			capturedStatus = status
+			return "https://github.com/brotherlogic/test-repo/issues/100", nil
+		}
+
+		output := captureStdout(t, func() {
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+		})
+
+		if !ensureCalled {
+			t.Errorf("expected EnsureSeedIssueFunc to be called when seed files are missing")
+		}
+		if capturedStatus.HasProto || capturedStatus.HasSpec {
+			t.Errorf("expected HasProto=false, HasSpec=false, got %+v", capturedStatus)
+		}
+		if !strings.Contains(output, "📋 Next Steps: Seed Files Required") {
+			t.Errorf("expected output to contain '📋 Next Steps: Seed Files Required', got:\n%s", output)
+		}
+		if !strings.Contains(output, "Tracking Issue: https://github.com/brotherlogic/test-repo/issues/100") {
+			t.Errorf("expected output to contain tracking issue URL, got:\n%s", output)
+		}
+	})
+
+	t.Run("missing seed files on idempotent no-change re-run invokes EnsureSeedIssueFunc and prints instructions", func(t *testing.T) {
+		tempDir := t.TempDir()
+		cfg := newBaseConfig(tempDir)
+		cfg.CheckScaffoldingChangesFunc = func(ctx context.Context, cfg *Config) (bool, error) {
+			return false, nil
+		}
+
+		ensureCalled := false
+		cfg.EnsureSeedIssueFunc = func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			ensureCalled = true
+			return "https://github.com/brotherlogic/test-repo/issues/100", nil
+		}
+
+		output := captureStdout(t, func() {
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+		})
+
+		if !ensureCalled {
+			t.Errorf("expected EnsureSeedIssueFunc to be called on idempotent no-change re-run when seed files are missing")
+		}
+		if !strings.Contains(output, "📋 Next Steps: Seed Files Required") {
+			t.Errorf("expected output to contain '📋 Next Steps: Seed Files Required', got:\n%s", output)
+		}
+	})
+
+	t.Run("skips EnsureSeedIssueFunc when both seed files are present", func(t *testing.T) {
+		tempDir := t.TempDir()
+		_ = os.MkdirAll(filepath.Join(tempDir, "proto"), 0755)
+		_ = os.MkdirAll(filepath.Join(tempDir, "specs"), 0755)
+		_ = os.WriteFile(filepath.Join(tempDir, "proto", "service.proto"), []byte("syntax = \"proto3\";\n"), 0644)
+		_ = os.WriteFile(filepath.Join(tempDir, "specs", "service.md"), []byte("# Spec\n"), 0644)
+
+		cfg := newBaseConfig(tempDir)
+		cfg.CheckScaffoldingChangesFunc = func(ctx context.Context, cfg *Config) (bool, error) {
+			return true, nil
+		}
+
+		ensureCalled := false
+		cfg.EnsureSeedIssueFunc = func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			ensureCalled = true
+			return "", nil
+		}
+
+		output := captureStdout(t, func() {
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("Run failed: %v", err)
+			}
+		})
+
+		if ensureCalled {
+			t.Errorf("expected EnsureSeedIssueFunc NOT to be called when seed files are present")
+		}
+		if !strings.Contains(output, "✓ Seed proto and spec files detected") {
+			t.Errorf("expected output to contain '✓ Seed proto and spec files detected', got:\n%s", output)
+		}
+	})
+
+	t.Run("non-fatal warning when EnsureSeedIssueFunc returns an error", func(t *testing.T) {
+		tempDir := t.TempDir()
+		cfg := newBaseConfig(tempDir)
+		cfg.CheckScaffoldingChangesFunc = func(ctx context.Context, cfg *Config) (bool, error) {
+			return true, nil
+		}
+		cfg.EnsureSeedIssueFunc = func(ctx context.Context, cfg *Config, status SeedStatus) (string, error) {
+			return "", errors.New("github API unavailable")
+		}
+
+		output := captureStdout(t, func() {
+			if err := Run(context.Background(), cfg); err != nil {
+				t.Fatalf("expected Run to succeed despite EnsureSeedIssueFunc error, got: %v", err)
+			}
+		})
+
+		if !strings.Contains(output, "⚠️  Warning: could not file seed tracking issue: github API unavailable") {
+			t.Errorf("expected non-fatal warning in output, got:\n%s", output)
+		}
+		if !strings.Contains(output, "📋 Next Steps: Seed Files Required") {
+			t.Errorf("expected final instructions in output, got:\n%s", output)
+		}
+	})
+}
+

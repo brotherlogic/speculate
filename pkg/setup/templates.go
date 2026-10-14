@@ -2,8 +2,38 @@ package setup
 
 import (
 	"bytes"
+	"fmt"
 	"text/template"
 )
+
+const (
+	SeedIssueTitle = "[Speculate] Add initial seed proto and spec files"
+	SeedIssueLabel = "speculate-seed"
+)
+
+// RenderSeedIssueBody renders the Markdown body for the seed tracking issue.
+func RenderSeedIssueBody(hasProto, hasSpec bool) string {
+	protoCheck := " "
+	if hasProto {
+		protoCheck = "x"
+	}
+	specCheck := " "
+	if hasSpec {
+		specCheck = "x"
+	}
+
+	return fmt.Sprintf(`## Seed Files Required for Speculate Alignment Loop
+
+This repository has been initialized with Speculate scaffolding, but is missing one or more initial seed files required to begin the autonomous alignment loop:
+
+- [%s] `+"`proto/*.proto`"+`: gRPC service and message definitions (`+"`> 0`"+` bytes)
+- [%s] `+"`specs/*.md`"+`: Staged behavioral specification (`+"`[Stage: ...]`"+`, `+"`> 0`"+` bytes)
+
+### Next Steps
+
+Please add the missing seed files to `+"`proto/`"+` and `+"`specs/`"+`, then commit and push them to the `+"`main`"+` branch. Once both files are present on `+"`main`"+`, Speculate will automatically close this tracking issue and initiate the autonomous alignment loop.
+`, protoCheck, specCheck)
+}
 
 type TemplateContext struct {
 	Owner string
