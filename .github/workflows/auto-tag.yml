@@ -11,6 +11,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: auto-tag-main
+  cancel-in-progress: false
+
 jobs:
   tag:
     if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
@@ -21,10 +25,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: '0'
+          ref: main
+
+      - name: Sanitize token
+        env:
+          RAW_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SAN_TOKEN=$(printf '%s' "$RAW_TOKEN" | tr -d '\r\n[:space:]')
+          FINAL_TOKEN="${SAN_TOKEN:-$FALLBACK_TOKEN}"
+          echo "::add-mask::${FINAL_TOKEN}"
+          echo "SAN_TOKEN=${FINAL_TOKEN}" >> "$GITHUB_ENV"
 
       - name: Bump version and push tag
         uses: anothrNick/github-tag-action@1.71.0
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ env.SAN_TOKEN }}
           WITH_V: true
           DEFAULT_BUMP: patch
