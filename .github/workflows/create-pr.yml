@@ -1,4 +1,4 @@
-name: Create Pull Request
+name: Create PR
 
 on:
   push:
@@ -8,16 +8,28 @@ on:
 jobs:
   create-pr:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Create Pull Request
-        run: |
-          REF_NAME="${{ github.ref_name }}"
-          BODY="Automated PR created from push to ${REF_NAME}.
-
-          Part of #1"
-          gh pr create --base main --head "$REF_NAME" --title "feat(kv): add basic KV schema and spec" --body "$BODY" || echo "PR already exists"
         env:
-          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+          RAW_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.AUTOMATION_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SAN_TOKEN=$(printf '%s' "$RAW_TOKEN" | tr -d '\r\n[:space:]')
+          export GH_TOKEN="${SAN_TOKEN:-$FALLBACK_TOKEN}"
+          if ! gh pr view --json number > /dev/null 2>&1; then
+            if ! gh pr create --base main --head "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --body "Automated PR for $GITHUB_REF_NAME"; then
+              if gh pr view --json number > /dev/null 2>&1; then
+                echo "PR already exists"
+              else
+                exit 1
+              fi
+            fi
+          else
+            echo "PR already exists"
+          fi

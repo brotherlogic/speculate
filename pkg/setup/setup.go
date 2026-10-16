@@ -243,6 +243,7 @@ func SetupTemplateFiles(cfg *Config) ([]string, error) {
 		filepath.Join(".github", "workflows", "review-gate.yml"): reviewGateContent,
 		filepath.Join(".github", "workflows", "auto-merge.yml"):  autoMergeTemplate,
 		filepath.Join(".github", "workflows", "tests.yml"):       testsTemplate,
+		filepath.Join(".github", "workflows", "create-pr.yml"):   createPrTemplate,
 	}
 
 	var written []string
