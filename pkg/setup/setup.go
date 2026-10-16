@@ -721,6 +721,27 @@ func GitCommitAndPushBranch(ctx context.Context, cfg *Config, branchName string)
 	return nil
 }
 
+// findOpenPRURL returns the URL of an open pull request for branchName targeting main, if one exists.
+func findOpenPRURL(ctx context.Context, cfg *Config, branchName string) (string, error) {
+	listCmd := ghCmd(ctx, cfg, "pr", "list", "--head", branchName, "--base", "main", "--state", "open", "--json", "url", "--jq", ".[0].url")
+	listOut, err := listCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr list failed: %s: %w", strings.TrimSpace(string(listOut)), err)
+	}
+
+	existingPR := strings.TrimSpace(string(listOut))
+	if existingPR != "" && existingPR != "null" {
+		for _, line := range strings.Split(existingPR, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+				return trimmed, nil
+			}
+		}
+		return existingPR, nil
+	}
+	return "", nil
+}
+
 // CreatePullRequest creates a pull request for the feature branch targeting main.
 func CreatePullRequest(ctx context.Context, cfg *Config, branchName string) (string, error) {
 	if branchName == "" {
@@ -734,21 +755,11 @@ func CreatePullRequest(ctx context.Context, cfg *Config, branchName string) (str
 		return cfg.CreatePRFunc(ctx, cfg, branchName, title, body)
 	}
 
-	listCmd := ghCmd(ctx, cfg, "pr", "list", "--head", branchName, "--base", "main", "--state", "open", "--json", "url", "--jq", ".[0].url")
-	listOut, err := listCmd.CombinedOutput()
+	existingPR, err := findOpenPRURL(ctx, cfg, branchName)
 	if err != nil {
-		return "", fmt.Errorf("gh pr list failed: %s: %w", strings.TrimSpace(string(listOut)), err)
+		return "", err
 	}
-
-	existingPR := strings.TrimSpace(string(listOut))
-	if existingPR != "" && existingPR != "null" {
-		for _, line := range strings.Split(existingPR, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
-				existingPR = trimmed
-				break
-			}
-		}
+	if existingPR != "" {
 		log.Printf("Existing open pull request detected: %s, reusing.", existingPR)
 		return existingPR, nil
 	}
@@ -756,6 +767,11 @@ func CreatePullRequest(ctx context.Context, cfg *Config, branchName string) (str
 	cmd := ghCmd(ctx, cfg, "pr", "create", "--base", "main", "--head", branchName, "--title", title, "--body", body)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// Handle concurrent PR creation race (e.g. from create-pr.yml workflow on branch push)
+		if existingPR, listErr := findOpenPRURL(ctx, cfg, branchName); listErr == nil && existingPR != "" {
+			log.Printf("Concurrent open pull request detected after create attempt: %s, reusing.", existingPR)
+			return existingPR, nil
+		}
 		return "", fmt.Errorf("gh pr create failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
