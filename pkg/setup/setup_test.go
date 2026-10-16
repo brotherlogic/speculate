@@ -105,8 +105,8 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetupTemplateFiles failed: %v", err)
 	}
-	if len(written) != 4 {
-		t.Fatalf("expected 4 written files, got %d: %v", len(written), written)
+	if len(written) != 5 {
+		t.Fatalf("expected 5 written files, got %d: %v", len(written), written)
 	}
 
 	// Verify CODEOWNERS has @brotherlogic
@@ -125,6 +125,23 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 	}
 	if !strings.Contains(string(reviewGateBytes), `PR_AUTHOR" = "brotherlogic"`) {
 		t.Errorf("expected review-gate.yml to contain brotherlogic author check, got:\n%s", string(reviewGateBytes))
+	}
+
+	// Verify create-pr.yml is created and contains expected trigger, token sanitization, and gh pr create command
+	createPRBytes, err := os.ReadFile(filepath.Join(tempDir, ".github", "workflows", "create-pr.yml"))
+	if err != nil {
+		t.Fatalf("reading create-pr.yml failed: %v", err)
+	}
+	createPRStr := string(createPRBytes)
+	for _, expectedSubstr := range []string{
+		"branches-ignore:",
+		"RAW_TOKEN:",
+		"SAN_TOKEN=",
+		`gh pr create --base main --head "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --body "Automated PR for $GITHUB_REF_NAME"`,
+	} {
+		if !strings.Contains(createPRStr, expectedSubstr) {
+			t.Errorf("expected create-pr.yml to contain %q, got:\n%s", expectedSubstr, createPRStr)
+		}
 	}
 
 	// 2. Second run without changes writes 0 files
@@ -2647,5 +2664,16 @@ func TestRun_SeedIssueLifecycle(t *testing.T) {
 			t.Errorf("expected final instructions in output, got:\n%s", output)
 		}
 	})
+}
+
+func TestLocalCreatePRWorkflowMatchesTemplate(t *testing.T) {
+	localWorkflowPath := filepath.Join("..", "..", ".github", "workflows", "create-pr.yml")
+	localBytes, err := os.ReadFile(localWorkflowPath)
+	if err != nil {
+		t.Fatalf("failed reading local create-pr.yml at %s: %v", localWorkflowPath, err)
+	}
+	if string(localBytes) != createPrTemplate {
+		t.Errorf("local .github/workflows/create-pr.yml does not match createPrTemplate.\nGot:\n%s\nWant:\n%s", string(localBytes), createPrTemplate)
+	}
 }
 

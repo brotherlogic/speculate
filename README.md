@@ -13,7 +13,7 @@ The `speculate init` command is the repository bootstrapping tool. It automates 
 ```mermaid
 flowchart TD
     A["speculate init"] --> B["1. Scaffold Directories<br/>(specs/, proto/, tests/, internal/)"]
-    B --> C["2. Provision Workflows & CODEOWNERS<br/>(review-gate, auto-merge, tests)"]
+    B --> C["2. Provision Workflows & CODEOWNERS<br/>(review-gate, auto-merge, tests, create-pr)"]
     C --> D{"User has Admin Access?"}
     D -- Yes --> E["3. Configure GitHub Repo Settings<br/>(auto-merge, branch deletion)"]
     E --> F["4. Configure Collaborator<br/>(invite @brotherlogic-automation)"]
@@ -137,6 +137,8 @@ Renders and writes repository governance templates:
   - Automatically enables squash auto-merge on pull requests once required status checks pass.
 - **`.github/workflows/tests.yml`**:
   - Runs unit/integration tests (`go test -v ./...`), builds all packages (`go build ./...`), and verifies linter (`go vet ./...`).
+- **`.github/workflows/create-pr.yml`**:
+  - Automatically opens a pull request against `main` when any non-`main` branch is pushed (if an open PR does not already exist for that branch).
 
 *If existing files differ from the templates, `speculate init` prompts interactively before overwriting (or overwrites immediately if `--force` is passed).*
 

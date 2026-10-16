@@ -225,6 +225,43 @@ jobs:
         run: go vet ./...
 `
 
+const createPrTemplate = `name: Create PR
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create Pull Request
+        env:
+          RAW_TOKEN: ${{ secrets.PERSONAL_TOKEN || secrets.AUTOMATION_TOKEN || secrets.GITHUB_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SAN_TOKEN=$(printf '%s' "$RAW_TOKEN" | tr -d '\r\n[:space:]')
+          export GH_TOKEN="${SAN_TOKEN:-$FALLBACK_TOKEN}"
+          if ! gh pr view --json number > /dev/null 2>&1; then
+            if ! gh pr create --base main --head "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --body "Automated PR for $GITHUB_REF_NAME"; then
+              if gh pr view --json number > /dev/null 2>&1; then
+                echo "PR already exists"
+              else
+                exit 1
+              fi
+            fi
+          else
+            echo "PR already exists"
+          fi
+`
+
 const initTestTemplate = `package tests
 
 import "testing"
