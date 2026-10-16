@@ -1447,6 +1447,41 @@ fi
 	}
 }
 
+func TestCreatePullRequest_ConcurrentCreationRaceRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	listCountFile := filepath.Join(tempDir, "list_count")
+	script := `
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  COUNT=0
+  if [ -f "` + listCountFile + `" ]; then
+    COUNT=$(cat "` + listCountFile + `")
+  fi
+  COUNT=$((COUNT + 1))
+  echo "$COUNT" > "` + listCountFile + `"
+  if [ "$COUNT" -eq 1 ]; then
+    exit 0
+  fi
+  echo "https://github.com/brotherlogic/test-repo/pull/77"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  echo "GraphQL error: A pull request already exists" >&2
+  exit 1
+fi
+`
+	setupMockGH(t, script)
+
+	cfg := &Config{RootDir: t.TempDir()}
+	url, err := CreatePullRequest(context.Background(), cfg, "feature/race-branch")
+	if err != nil {
+		t.Fatalf("expected CreatePullRequest to recover from concurrent creation race, got error: %v", err)
+	}
+	if url != "https://github.com/brotherlogic/test-repo/pull/77" {
+		t.Errorf("expected recovered url %q, got %q", "https://github.com/brotherlogic/test-repo/pull/77", url)
+	}
+}
+
+
 func TestEnableAutoMerge_HookInvocation(t *testing.T) {
 	hookCalled := false
 	var gotURL string
