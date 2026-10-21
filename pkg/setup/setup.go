@@ -37,8 +37,9 @@ type Config struct {
 	PollTimeout                 time.Duration
 	BranchName                  string
 	SyncMainBranchFunc          func(ctx context.Context, cfg *Config, branchName string) error
-	ConfigureRepoFunc           func(ctx context.Context, cfg *Config) error
-	ConfigureCollabFunc         func(ctx context.Context, cfg *Config) error
+	ConfigureRepoFunc                func(ctx context.Context, cfg *Config) error
+	ConfigureCollabFunc              func(ctx context.Context, cfg *Config) error
+	ConfigureWorkflowPermissionsFunc func(ctx context.Context, cfg *Config) error
 	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
 	CheckToolchainFunc          func(ctx context.Context) error
@@ -396,6 +397,23 @@ func ConfigureCollaborator(ctx context.Context, cfg *Config) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("configuring collaborator: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+// ConfigureWorkflowPermissions enables write permissions and PR creation/approval for GitHub Actions workflows.
+func ConfigureWorkflowPermissions(ctx context.Context, cfg *Config) error {
+	if cfg.ConfigureWorkflowPermissionsFunc != nil {
+		return cfg.ConfigureWorkflowPermissionsFunc(ctx, cfg)
+	}
+
+	endpoint := fmt.Sprintf("repos/%s/actions/permissions/workflow", cfg.Repo)
+	cmd := ghCmd(ctx, cfg, "api", endpoint, "-X", "PUT",
+		"-f", "default_workflow_permissions=write",
+		"-F", "can_approve_pull_request_reviews=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("configuring workflow permissions via gh: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
@@ -1078,6 +1096,13 @@ func Run(ctx context.Context, cfg *Config) error {
 			} else {
 				fmt.Println("✓ Done")
 			}
+		}
+
+		fmt.Printf("7c. Configuring GitHub Actions workflow permissions (%s)... ", cfg.Repo)
+		if err := ConfigureWorkflowPermissions(ctx, cfg); err != nil {
+			fmt.Printf("⚠️  Warning: %v\n", err)
+		} else {
+			fmt.Println("✓ Workflow write & PR creation permissions enabled")
 		}
 	} else {
 		fmt.Printf("7. Note: Admin permissions required for repository settings and collaborators on %s.\n", cfg.Repo)

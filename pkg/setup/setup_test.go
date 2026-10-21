@@ -220,6 +220,10 @@ func TestRun_SuccessWithPRWorkflow(t *testing.T) {
 			executionOrder = append(executionOrder, "collaborator")
 			return nil
 		},
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "workflow_permissions")
+			return nil
+		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
 			executionOrder = append(executionOrder, "check_scaffolding")
 			return true, nil
@@ -266,6 +270,7 @@ func TestRun_SuccessWithPRWorkflow(t *testing.T) {
 		"check_permissions",
 		"repo_settings",
 		"collaborator",
+		"workflow_permissions",
 		"check_scaffolding",
 		"commit_and_push_branch",
 		"create_pr",
@@ -323,6 +328,9 @@ func TestRun_IdempotentCleanTree_NoOp(t *testing.T) {
 		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
 			// Clean tree: no staged changes
 			return false, nil
@@ -372,6 +380,9 @@ func TestRun_AbortionOnCICheckFailure(t *testing.T) {
 			return nil
 		},
 		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
@@ -431,6 +442,9 @@ func TestRun_PollingTimeout(t *testing.T) {
 			return nil
 		},
 		ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
@@ -510,6 +524,10 @@ func TestRun_FullScaffoldingE2E(t *testing.T) {
 			executionOrder = append(executionOrder, "collaborator")
 			return nil
 		},
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "workflow_permissions")
+			return nil
+		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
 			executionOrder = append(executionOrder, "check_scaffolding")
 			return true, nil
@@ -555,6 +573,7 @@ func TestRun_FullScaffoldingE2E(t *testing.T) {
 		"check_permissions",
 		"repo_settings",
 		"collaborator",
+		"workflow_permissions",
 		"check_scaffolding",
 		"commit_and_push_branch",
 		"create_pr",
@@ -2529,6 +2548,9 @@ func TestRun_SeedIssueLifecycle(t *testing.T) {
 			ConfigureCollabFunc: func(ctx context.Context, cfg *Config) error {
 				return nil
 			},
+			ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
 			CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
 				return nil
 			},
@@ -2711,4 +2733,64 @@ func TestLocalCreatePRWorkflowMatchesTemplate(t *testing.T) {
 		t.Errorf("local .github/workflows/create-pr.yml does not match createPrTemplate.\nGot:\n%s\nWant:\n%s", string(localBytes), createPrTemplate)
 	}
 }
+
+func TestConfigureWorkflowPermissions_HookInvocation(t *testing.T) {
+	hookCalled := false
+	cfg := &Config{
+		Repo: "brotherlogic/test-repo",
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			hookCalled = true
+			return nil
+		},
+	}
+
+	if err := ConfigureWorkflowPermissions(context.Background(), cfg); err != nil {
+		t.Fatalf("unexpected error from ConfigureWorkflowPermissions: %v", err)
+	}
+	if !hookCalled {
+		t.Errorf("expected ConfigureWorkflowPermissionsFunc hook to be called")
+	}
+}
+
+func TestConfigureWorkflowPermissions_CommandExecution(t *testing.T) {
+	_, logFile := setupMockGH(t, "exit 0")
+
+	cfg := &Config{
+		RootDir: t.TempDir(),
+		Repo:    "brotherlogic/test-repo",
+	}
+	if err := ConfigureWorkflowPermissions(context.Background(), cfg); err != nil {
+		t.Fatalf("unexpected error from ConfigureWorkflowPermissions: %v", err)
+	}
+
+	loggedArgsBytes, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("failed reading mock gh args log: %v", err)
+	}
+	loggedArgs := strings.TrimSpace(string(loggedArgsBytes))
+	expectedArgs := "api repos/brotherlogic/test-repo/actions/permissions/workflow -X PUT -f default_workflow_permissions=write -F can_approve_pull_request_reviews=true"
+	if loggedArgs != expectedArgs {
+		t.Errorf("expected gh command args:\n%q\ngot:\n%q", expectedArgs, loggedArgs)
+	}
+}
+
+func TestConfigureWorkflowPermissions_CommandFailure(t *testing.T) {
+	setupMockGH(t, "echo 'HTTP 403: Resource not accessible by integration' >&2\nexit 1")
+
+	cfg := &Config{
+		RootDir: t.TempDir(),
+		Repo:    "brotherlogic/test-repo",
+	}
+	err := ConfigureWorkflowPermissions(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected error when gh api fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "configuring workflow permissions via gh") {
+		t.Errorf("expected error message to contain 'configuring workflow permissions via gh', got %v", err)
+	}
+	if !strings.Contains(err.Error(), "HTTP 403") {
+		t.Errorf("expected error message to contain stderr output 'HTTP 403', got %v", err)
+	}
+}
+
 
