@@ -135,13 +135,26 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 	createPRStr := string(createPRBytes)
 	for _, expectedSubstr := range []string{
 		"branches-ignore:",
+		"fetch-depth: 0",
 		"RAW_TOKEN:",
 		"SAN_TOKEN=",
+		"git rev-list --count origin/main..HEAD",
+		"No commits ahead of main; skipping PR creation.",
 		`gh pr create --base main --head "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --body "Automated PR for $GITHUB_REF_NAME"`,
 	} {
 		if !strings.Contains(createPRStr, expectedSubstr) {
 			t.Errorf("expected create-pr.yml to contain %q, got:\n%s", expectedSubstr, createPRStr)
 		}
+	}
+
+	// Verify tests.yml triggers on main and does not contain 'feat/**'
+	testsBytes, err := os.ReadFile(filepath.Join(tempDir, ".github", "workflows", "tests.yml"))
+	if err != nil {
+		t.Fatalf("reading tests.yml failed: %v", err)
+	}
+	testsStr := string(testsBytes)
+	if strings.Contains(testsStr, "'feat/**'") {
+		t.Errorf("expected tests.yml not to contain 'feat/**', got:\n%s", testsStr)
 	}
 
 	// 2. Second run without changes writes 0 files
@@ -2731,6 +2744,17 @@ func TestLocalCreatePRWorkflowMatchesTemplate(t *testing.T) {
 	}
 	if string(localBytes) != createPrTemplate {
 		t.Errorf("local .github/workflows/create-pr.yml does not match createPrTemplate.\nGot:\n%s\nWant:\n%s", string(localBytes), createPrTemplate)
+	}
+}
+
+func TestLocalTestsWorkflowMatchesTemplate(t *testing.T) {
+	localWorkflowPath := filepath.Join("..", "..", ".github", "workflows", "tests.yml")
+	localBytes, err := os.ReadFile(localWorkflowPath)
+	if err != nil {
+		t.Fatalf("failed reading local tests.yml at %s: %v", localWorkflowPath, err)
+	}
+	if string(localBytes) != testsTemplate {
+		t.Errorf("local .github/workflows/tests.yml does not match testsTemplate.\nGot:\n%s\nWant:\n%s", string(localBytes), testsTemplate)
 	}
 }
 

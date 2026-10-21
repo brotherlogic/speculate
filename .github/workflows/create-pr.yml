@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Create Pull Request
         env:
@@ -22,6 +24,11 @@ jobs:
         run: |
           SAN_TOKEN=$(printf '%s' "$RAW_TOKEN" | tr -d '\r\n[:space:]')
           export GH_TOKEN="${SAN_TOKEN:-$FALLBACK_TOKEN}"
+          COMMITS_AHEAD=$(git rev-list --count origin/main..HEAD)
+          if [ "$COMMITS_AHEAD" -eq 0 ]; then
+            echo "No commits ahead of main; skipping PR creation."
+            exit 0
+          fi
           if ! gh pr view --json number > /dev/null 2>&1; then
             if ! gh pr create --base main --head "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --body "Automated PR for $GITHUB_REF_NAME"; then
               if gh pr view --json number > /dev/null 2>&1; then
