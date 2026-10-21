@@ -40,7 +40,14 @@ type Config struct {
 	ConfigureRepoFunc                func(ctx context.Context, cfg *Config) error
 	ConfigureCollabFunc              func(ctx context.Context, cfg *Config) error
 	ConfigureWorkflowPermissionsFunc func(ctx context.Context, cfg *Config) error
-	CommitAndPushFunc           func(ctx context.Context, cfg *Config) error
+	EnsurePersonalTokenFunc          func(ctx context.Context, cfg *Config) error
+	CheckSecretExistsFunc            func(ctx context.Context, cfg *Config, secretName string) (bool, error)
+	ResolveActiveTokenFunc           func(ctx context.Context, cfg *Config) (string, error)
+	ValidateTokenScopesFunc          func(ctx context.Context, cfg *Config, token string) error
+	SetRepoSecretFunc                func(ctx context.Context, cfg *Config, secretName, secretValue string) error
+	ConfirmTokenPromptFunc           func(repo string) bool
+	ReadTokenPromptFunc              func(repo string) (string, error)
+	CommitAndPushFunc                func(ctx context.Context, cfg *Config) error
 	ConfigureRulesetsFunc       func(ctx context.Context, cfg *Config) error
 	CheckToolchainFunc          func(ctx context.Context) error
 	EnsureGoModuleFunc          func(ctx context.Context, cfg *Config) error
@@ -416,6 +423,242 @@ func ConfigureWorkflowPermissions(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("configuring workflow permissions via gh: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return nil
+}
+
+// CheckSecretExists inspects the target repository's GitHub Actions secrets to check if secretName exists.
+func CheckSecretExists(ctx context.Context, cfg *Config, secretName string) (bool, error) {
+	if cfg != nil && cfg.CheckSecretExistsFunc != nil {
+		return cfg.CheckSecretExistsFunc(ctx, cfg, secretName)
+	}
+
+	cmd := ghCmd(ctx, cfg, "secret", "list", "--repo", cfg.Repo, "--json", "name", "--jq", ".[].name")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("listing repository secrets via gh: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == secretName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ResolveActiveToken resolves the active GitHub authentication token from Config, environment, or gh CLI.
+func ResolveActiveToken(ctx context.Context, cfg *Config) (string, error) {
+	if cfg != nil && cfg.ResolveActiveTokenFunc != nil {
+		return cfg.ResolveActiveTokenFunc(ctx, cfg)
+	}
+
+	if cfg != nil {
+		if tok := strings.TrimSpace(cfg.Token); tok != "" {
+			return tok, nil
+		}
+	}
+
+	if tok := strings.TrimSpace(os.Getenv("GH_TOKEN")); tok != "" {
+		return tok, nil
+	}
+	if tok := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); tok != "" {
+		return tok, nil
+	}
+
+	cmd := ghCmd(ctx, cfg, "auth", "token")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("resolving active token via gh auth token: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	tok := strings.TrimSpace(string(out))
+	if tok == "" {
+		return "", errors.New("gh auth token returned an empty token")
+	}
+	return tok, nil
+}
+
+// ValidateTokenScopes verifies that token is non-empty, authenticated, and includes 'repo' and 'workflow' scopes
+// (or is a fine-grained token authenticated for cfg.Repo).
+func ValidateTokenScopes(ctx context.Context, cfg *Config, token string) error {
+	if cfg != nil && cfg.ValidateTokenScopesFunc != nil {
+		return cfg.ValidateTokenScopesFunc(ctx, cfg, token)
+	}
+
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return errors.New("token cannot be empty")
+	}
+
+	cmd := exec.CommandContext(ctx, "gh", "auth", "status")
+	if cfg != nil && cfg.RootDir != "" {
+		cmd.Dir = cfg.RootDir
+	}
+	cmd.Env = append(os.Environ(), "GH_TOKEN="+token, "GITHUB_TOKEN="+token)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("validating token via gh auth status: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
+	output := string(out)
+	lowerOutput := strings.ToLower(output)
+	if strings.HasPrefix(token, "github_pat_") || strings.Contains(lowerOutput, "token scopes: none") {
+		if cfg != nil && cfg.Repo != "" {
+			apiCmd := exec.CommandContext(ctx, "gh", "api", fmt.Sprintf("repos/%s", cfg.Repo))
+			if cfg.RootDir != "" {
+				apiCmd.Dir = cfg.RootDir
+			}
+			apiCmd.Env = append(os.Environ(), "GH_TOKEN="+token, "GITHUB_TOKEN="+token)
+			if apiOut, apiErr := apiCmd.CombinedOutput(); apiErr != nil {
+				return fmt.Errorf("fine-grained token failed repository access check for %s: %s: %w", cfg.Repo, strings.TrimSpace(string(apiOut)), apiErr)
+			}
+		}
+		return nil
+	}
+
+	scopeText := output
+	for _, line := range strings.Split(output, "\n") {
+		lowerLine := strings.ToLower(line)
+		if idx := strings.Index(lowerLine, "token scopes:"); idx != -1 {
+			scopeText = line[idx+len("token scopes:"):]
+			break
+		}
+		if idx := strings.Index(lowerLine, "x-oauth-scopes:"); idx != -1 {
+			scopeText = line[idx+len("x-oauth-scopes:"):]
+			break
+		}
+	}
+
+	foundScopes := make(map[string]bool)
+	fields := strings.FieldsFunc(scopeText, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n' || r == '\'' || r == '"'
+	})
+	for _, f := range fields {
+		foundScopes[strings.ToLower(strings.TrimSpace(f))] = true
+	}
+
+	var missing []string
+	for _, req := range []string{"repo", "workflow"} {
+		if !foundScopes[req] {
+			missing = append(missing, req)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("token is missing required scopes: %s (requires 'repo' and 'workflow')", strings.Join(missing, ", "))
+	}
+
+	return nil
+}
+
+// SetRepoSecret sets a GitHub Actions secret on cfg.Repo using gh secret set.
+func SetRepoSecret(ctx context.Context, cfg *Config, secretName, secretValue string) error {
+	if cfg != nil && cfg.SetRepoSecretFunc != nil {
+		return cfg.SetRepoSecretFunc(ctx, cfg, secretName, secretValue)
+	}
+
+	secretName = strings.TrimSpace(secretName)
+	secretValue = strings.TrimSpace(secretValue)
+	if secretName == "" {
+		return errors.New("secret name cannot be empty")
+	}
+	if secretValue == "" {
+		return errors.New("secret value cannot be empty")
+	}
+
+	cmd := ghCmd(ctx, cfg, "secret", "set", secretName, "--repo", cfg.Repo)
+	cmd.Stdin = strings.NewReader(secretValue)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("setting secret %s via gh: %s: %w", secretName, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+func defaultConfirmTokenPrompt(repo string) bool {
+	fmt.Printf("Set active GitHub token as PERSONAL_TOKEN secret on %s? [y/N]: ", repo)
+	var resp string
+	_, _ = fmt.Scanln(&resp)
+	resp = strings.TrimSpace(resp)
+	return strings.EqualFold(resp, "y") || strings.EqualFold(resp, "yes")
+}
+
+func defaultReadTokenPrompt(repo string) (string, error) {
+	fmt.Printf("Enter a GitHub Personal Access Token (with 'repo' and 'workflow' scopes) for %s: ", repo)
+	var token string
+	if _, err := fmt.Scanln(&token); err != nil {
+		return "", fmt.Errorf("reading token from stdin: %w", err)
+	}
+	return strings.TrimSpace(token), nil
+}
+
+// EnsurePersonalToken verifies that PERSONAL_TOKEN is configured in the target repository's
+// GitHub Actions secrets, validating active token scopes and prompting for confirmation or a fallback PAT as needed.
+func EnsurePersonalToken(ctx context.Context, cfg *Config) error {
+	if cfg != nil && cfg.EnsurePersonalTokenFunc != nil {
+		return cfg.EnsurePersonalTokenFunc(ctx, cfg)
+	}
+
+	exists, err := CheckSecretExists(ctx, cfg, "PERSONAL_TOKEN")
+	if err != nil {
+		return fmt.Errorf("checking PERSONAL_TOKEN secret: %w", err)
+	}
+	if exists && !cfg.Force {
+		log.Printf("PERSONAL_TOKEN secret already exists on %s, skipping provisioning", cfg.Repo)
+		return nil
+	}
+
+	token, resolveErr := ResolveActiveToken(ctx, cfg)
+	var scopeErr error
+	if resolveErr == nil && strings.TrimSpace(token) != "" {
+		scopeErr = ValidateTokenScopes(ctx, cfg, token)
+		if scopeErr == nil {
+			if cfg.Force {
+				return SetRepoSecret(ctx, cfg, "PERSONAL_TOKEN", token)
+			}
+
+			fmt.Printf("\nPERSONAL_TOKEN will be configured on %s to enable automated PR creation and downstream CI triggers.\n", cfg.Repo)
+			confirmed := false
+			if cfg.ConfirmTokenPromptFunc != nil {
+				confirmed = cfg.ConfirmTokenPromptFunc(cfg.Repo)
+			} else {
+				confirmed = defaultConfirmTokenPrompt(cfg.Repo)
+			}
+			if confirmed {
+				return SetRepoSecret(ctx, cfg, "PERSONAL_TOKEN", token)
+			}
+		} else {
+			fmt.Printf("⚠️  Active GitHub token cannot be used for PERSONAL_TOKEN: %v\n", scopeErr)
+		}
+	}
+
+	if cfg.Force {
+		if scopeErr != nil {
+			return fmt.Errorf("cannot provision PERSONAL_TOKEN in non-interactive (--force) mode: %w", scopeErr)
+		}
+		if resolveErr != nil {
+			return fmt.Errorf("cannot provision PERSONAL_TOKEN in non-interactive (--force) mode: %w", resolveErr)
+		}
+		return errors.New("cannot provision PERSONAL_TOKEN in non-interactive (--force) mode: no valid token available")
+	}
+
+	var fallbackToken string
+	var readErr error
+	if cfg.ReadTokenPromptFunc != nil {
+		fallbackToken, readErr = cfg.ReadTokenPromptFunc(cfg.Repo)
+	} else {
+		fallbackToken, readErr = defaultReadTokenPrompt(cfg.Repo)
+	}
+	if readErr != nil {
+		return fmt.Errorf("reading fallback PERSONAL_TOKEN: %w", readErr)
+	}
+	fallbackToken = strings.TrimSpace(fallbackToken)
+	if fallbackToken == "" {
+		return errors.New("no token provided for PERSONAL_TOKEN")
+	}
+
+	if err := ValidateTokenScopes(ctx, cfg, fallbackToken); err != nil {
+		return fmt.Errorf("fallback token validation failed: %w", err)
+	}
+
+	return SetRepoSecret(ctx, cfg, "PERSONAL_TOKEN", fallbackToken)
 }
 
 // RulesetPayload represents the JSON body for the GitHub branch ruleset.
@@ -1104,6 +1347,12 @@ func Run(ctx context.Context, cfg *Config) error {
 		} else {
 			fmt.Println("✓ Workflow write & PR creation permissions enabled")
 		}
+
+		fmt.Printf("7d. Ensuring PERSONAL_TOKEN secret on GitHub (%s)... ", cfg.Repo)
+		if err := EnsurePersonalToken(ctx, cfg); err != nil {
+			return fmt.Errorf("failed ensuring PERSONAL_TOKEN secret: %w", err)
+		}
+		fmt.Println("✓ PERSONAL_TOKEN configured")
 	} else {
 		fmt.Printf("7. Note: Admin permissions required for repository settings and collaborators on %s.\n", cfg.Repo)
 	}

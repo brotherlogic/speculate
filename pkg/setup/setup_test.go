@@ -237,6 +237,10 @@ func TestRun_SuccessWithPRWorkflow(t *testing.T) {
 			executionOrder = append(executionOrder, "workflow_permissions")
 			return nil
 		},
+		EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "ensure_personal_token")
+			return nil
+		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
 			executionOrder = append(executionOrder, "check_scaffolding")
 			return true, nil
@@ -284,6 +288,7 @@ func TestRun_SuccessWithPRWorkflow(t *testing.T) {
 		"repo_settings",
 		"collaborator",
 		"workflow_permissions",
+		"ensure_personal_token",
 		"check_scaffolding",
 		"commit_and_push_branch",
 		"create_pr",
@@ -344,6 +349,9 @@ func TestRun_IdempotentCleanTree_NoOp(t *testing.T) {
 		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
+		EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
 			// Clean tree: no staged changes
 			return false, nil
@@ -396,6 +404,9 @@ func TestRun_AbortionOnCICheckFailure(t *testing.T) {
 			return nil
 		},
 		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
@@ -458,6 +469,9 @@ func TestRun_PollingTimeout(t *testing.T) {
 			return nil
 		},
 		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
 			return nil
 		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
@@ -541,6 +555,10 @@ func TestRun_FullScaffoldingE2E(t *testing.T) {
 			executionOrder = append(executionOrder, "workflow_permissions")
 			return nil
 		},
+		EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
+			executionOrder = append(executionOrder, "ensure_personal_token")
+			return nil
+		},
 		CheckScaffoldingChangesFunc: func(ctx context.Context, cfg *Config) (bool, error) {
 			executionOrder = append(executionOrder, "check_scaffolding")
 			return true, nil
@@ -587,6 +605,7 @@ func TestRun_FullScaffoldingE2E(t *testing.T) {
 		"repo_settings",
 		"collaborator",
 		"workflow_permissions",
+		"ensure_personal_token",
 		"check_scaffolding",
 		"commit_and_push_branch",
 		"create_pr",
@@ -2564,6 +2583,9 @@ func TestRun_SeedIssueLifecycle(t *testing.T) {
 			ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
 				return nil
 			},
+			EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
+				return nil
+			},
 			CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
 				return nil
 			},
@@ -2816,5 +2838,559 @@ func TestConfigureWorkflowPermissions_CommandFailure(t *testing.T) {
 		t.Errorf("expected error message to contain stderr output 'HTTP 403', got %v", err)
 	}
 }
+
+func TestCheckSecretExists(t *testing.T) {
+	t.Run("delegates to CheckSecretExistsFunc when set", func(t *testing.T) {
+		var gotSecret string
+		cfg := &Config{
+			Repo: "brotherlogic/test-repo",
+			CheckSecretExistsFunc: func(ctx context.Context, cfg *Config, secretName string) (bool, error) {
+				gotSecret = secretName
+				return true, nil
+			},
+		}
+		exists, err := CheckSecretExists(context.Background(), cfg, "PERSONAL_TOKEN")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !exists {
+			t.Errorf("expected exists=true, got false")
+		}
+		if gotSecret != "PERSONAL_TOKEN" {
+			t.Errorf("expected secretName PERSONAL_TOKEN, got %q", gotSecret)
+		}
+	})
+
+	t.Run("returns true when secret is listed by gh secret list", func(t *testing.T) {
+		_, logFile := setupMockGH(t, "echo 'OTHER_SECRET\nPERSONAL_TOKEN\nANOTHER_SECRET'")
+		cfg := &Config{
+			RootDir: t.TempDir(),
+			Repo:    "brotherlogic/test-repo",
+		}
+		exists, err := CheckSecretExists(context.Background(), cfg, "PERSONAL_TOKEN")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !exists {
+			t.Errorf("expected PERSONAL_TOKEN to be found")
+		}
+		loggedBytes, _ := os.ReadFile(logFile)
+		logged := strings.TrimSpace(string(loggedBytes))
+		expected := "secret list --repo brotherlogic/test-repo --json name --jq .[].name"
+		if logged != expected {
+			t.Errorf("expected gh command %q, got %q", expected, logged)
+		}
+	})
+
+	t.Run("returns false when secret is not listed", func(t *testing.T) {
+		setupMockGH(t, "echo 'OTHER_SECRET\nANOTHER_SECRET'")
+		cfg := &Config{
+			RootDir: t.TempDir(),
+			Repo:    "brotherlogic/test-repo",
+		}
+		exists, err := CheckSecretExists(context.Background(), cfg, "PERSONAL_TOKEN")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if exists {
+			t.Errorf("expected PERSONAL_TOKEN not to be found")
+		}
+	})
+
+	t.Run("returns error when gh secret list fails", func(t *testing.T) {
+		setupMockGH(t, "echo 'HTTP 403: Forbidden' >&2\nexit 1")
+		cfg := &Config{
+			RootDir: t.TempDir(),
+			Repo:    "brotherlogic/test-repo",
+		}
+		_, err := CheckSecretExists(context.Background(), cfg, "PERSONAL_TOKEN")
+		if err == nil {
+			t.Fatalf("expected error on gh secret list failure, got nil")
+		}
+		if !strings.Contains(err.Error(), "HTTP 403") {
+			t.Errorf("expected error to contain 'HTTP 403', got %v", err)
+		}
+	})
+}
+
+func TestResolveActiveToken(t *testing.T) {
+	t.Run("delegates to ResolveActiveTokenFunc when set", func(t *testing.T) {
+		cfg := &Config{
+			ResolveActiveTokenFunc: func(ctx context.Context, cfg *Config) (string, error) {
+				return "hook-token", nil
+			},
+		}
+		tok, err := ResolveActiveToken(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok != "hook-token" {
+			t.Errorf("expected 'hook-token', got %q", tok)
+		}
+	})
+
+	t.Run("returns cfg.Token first when non-empty", func(t *testing.T) {
+		t.Setenv("GH_TOKEN", "env-gh-token")
+		t.Setenv("GITHUB_TOKEN", "env-github-token")
+		cfg := &Config{Token: "  cfg-token-123  "}
+		tok, err := ResolveActiveToken(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok != "cfg-token-123" {
+			t.Errorf("expected 'cfg-token-123', got %q", tok)
+		}
+	})
+
+	t.Run("returns GH_TOKEN from env when cfg.Token is empty", func(t *testing.T) {
+		t.Setenv("GH_TOKEN", "  env-gh-token  ")
+		t.Setenv("GITHUB_TOKEN", "env-github-token")
+		cfg := &Config{}
+		tok, err := ResolveActiveToken(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok != "env-gh-token" {
+			t.Errorf("expected 'env-gh-token', got %q", tok)
+		}
+	})
+
+	t.Run("returns GITHUB_TOKEN from env when GH_TOKEN is empty", func(t *testing.T) {
+		t.Setenv("GH_TOKEN", "")
+		t.Setenv("GITHUB_TOKEN", "  env-github-token  ")
+		cfg := &Config{}
+		tok, err := ResolveActiveToken(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok != "env-github-token" {
+			t.Errorf("expected 'env-github-token', got %q", tok)
+		}
+	})
+
+	t.Run("falls back to gh auth token when env vars are empty", func(t *testing.T) {
+		t.Setenv("GH_TOKEN", "")
+		t.Setenv("GITHUB_TOKEN", "")
+		_, logFile := setupMockGH(t, "echo '  ghp_cli_token_xyz  '")
+		cfg := &Config{RootDir: t.TempDir()}
+		tok, err := ResolveActiveToken(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if tok != "ghp_cli_token_xyz" {
+			t.Errorf("expected 'ghp_cli_token_xyz', got %q", tok)
+		}
+		loggedBytes, _ := os.ReadFile(logFile)
+		if strings.TrimSpace(string(loggedBytes)) != "auth token" {
+			t.Errorf("expected 'auth token' command, got %q", strings.TrimSpace(string(loggedBytes)))
+		}
+	})
+
+	t.Run("returns error when no token is available and gh auth token fails", func(t *testing.T) {
+		t.Setenv("GH_TOKEN", "")
+		t.Setenv("GITHUB_TOKEN", "")
+		setupMockGH(t, "echo 'not logged in' >&2\nexit 1")
+		cfg := &Config{RootDir: t.TempDir()}
+		_, err := ResolveActiveToken(context.Background(), cfg)
+		if err == nil {
+			t.Fatalf("expected error when no token can be resolved, got nil")
+		}
+	})
+}
+
+func TestValidateTokenScopes(t *testing.T) {
+	t.Run("delegates to ValidateTokenScopesFunc when set", func(t *testing.T) {
+		var gotToken string
+		cfg := &Config{
+			ValidateTokenScopesFunc: func(ctx context.Context, cfg *Config, token string) error {
+				gotToken = token
+				return nil
+			},
+		}
+		if err := ValidateTokenScopes(context.Background(), cfg, "my-token"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotToken != "my-token" {
+			t.Errorf("expected 'my-token', got %q", gotToken)
+		}
+	})
+
+	t.Run("rejects empty token", func(t *testing.T) {
+		cfg := &Config{Repo: "brotherlogic/test-repo"}
+		if err := ValidateTokenScopes(context.Background(), cfg, "   "); err == nil {
+			t.Fatalf("expected error for empty token, got nil")
+		}
+	})
+
+	t.Run("accepts classic PAT with repo and workflow scopes", func(t *testing.T) {
+		script := `
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "github.com"
+  echo "  ✓ Logged in to github.com account brotherlogic"
+  echo "  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'"
+  exit 0
+fi
+`
+		setupMockGH(t, script)
+		cfg := &Config{RootDir: t.TempDir(), Repo: "brotherlogic/test-repo"}
+		if err := ValidateTokenScopes(context.Background(), cfg, "ghp_valid123"); err != nil {
+			t.Fatalf("expected valid scopes to pass, got error: %v", err)
+		}
+	})
+
+	t.Run("reports missing workflow scope", func(t *testing.T) {
+		script := `
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "  - Token scopes: 'read:org', 'repo'"
+  exit 0
+fi
+`
+		setupMockGH(t, script)
+		cfg := &Config{RootDir: t.TempDir(), Repo: "brotherlogic/test-repo"}
+		err := ValidateTokenScopes(context.Background(), cfg, "ghp_noworkflow")
+		if err == nil {
+			t.Fatalf("expected error when workflow scope is missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "workflow") {
+			t.Errorf("expected error to list missing 'workflow' scope, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "missing required scopes: repo") {
+			t.Errorf("did not expect 'repo' to be listed as missing, got: %v", err)
+		}
+	})
+
+	t.Run("reports missing repo and workflow scopes", func(t *testing.T) {
+		script := `
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "  - Token scopes: 'gist', 'read:org'"
+  exit 0
+fi
+`
+		setupMockGH(t, script)
+		cfg := &Config{RootDir: t.TempDir(), Repo: "brotherlogic/test-repo"}
+		err := ValidateTokenScopes(context.Background(), cfg, "ghp_noscopes")
+		if err == nil {
+			t.Fatalf("expected error when repo and workflow scopes are missing, got nil")
+		}
+		if !strings.Contains(err.Error(), "repo") || !strings.Contains(err.Error(), "workflow") {
+			t.Errorf("expected error to mention both 'repo' and 'workflow', got: %v", err)
+		}
+	})
+
+	t.Run("accepts fine-grained PAT authenticated for target repository", func(t *testing.T) {
+		script := `
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  echo "  - Token scopes: none"
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/brotherlogic/test-repo" ]; then
+  echo '{"id":123}'
+  exit 0
+fi
+exit 1
+`
+		setupMockGH(t, script)
+		cfg := &Config{RootDir: t.TempDir(), Repo: "brotherlogic/test-repo"}
+		if err := ValidateTokenScopes(context.Background(), cfg, "github_pat_finegrained"); err != nil {
+			t.Fatalf("expected fine-grained PAT to pass when repo access succeeds, got: %v", err)
+		}
+	})
+}
+
+func TestSetRepoSecret(t *testing.T) {
+	t.Run("delegates to SetRepoSecretFunc when set", func(t *testing.T) {
+		var gotName, gotVal string
+		cfg := &Config{
+			Repo: "brotherlogic/test-repo",
+			SetRepoSecretFunc: func(ctx context.Context, cfg *Config, secretName, secretValue string) error {
+				gotName = secretName
+				gotVal = secretValue
+				return nil
+			},
+		}
+		if err := SetRepoSecret(context.Background(), cfg, "PERSONAL_TOKEN", "secret-val"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotName != "PERSONAL_TOKEN" || gotVal != "secret-val" {
+			t.Errorf("expected (PERSONAL_TOKEN, secret-val), got (%q, %q)", gotName, gotVal)
+		}
+	})
+
+	t.Run("executes gh secret set with secret value on stdin", func(t *testing.T) {
+		tempDir := t.TempDir()
+		stdinFile := filepath.Join(tempDir, "stdin.txt")
+		script := `
+cat > "` + stdinFile + `"
+exit 0
+`
+		_, logFile := setupMockGH(t, script)
+		cfg := &Config{
+			RootDir: tempDir,
+			Repo:    "brotherlogic/test-repo",
+		}
+		if err := SetRepoSecret(context.Background(), cfg, "PERSONAL_TOKEN", "ghp_secret_123"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		loggedBytes, _ := os.ReadFile(logFile)
+		expectedArgs := "secret set PERSONAL_TOKEN --repo brotherlogic/test-repo"
+		if strings.TrimSpace(string(loggedBytes)) != expectedArgs {
+			t.Errorf("expected args %q, got %q", expectedArgs, strings.TrimSpace(string(loggedBytes)))
+		}
+		stdinBytes, _ := os.ReadFile(stdinFile)
+		if string(stdinBytes) != "ghp_secret_123" {
+			t.Errorf("expected stdin %q, got %q", "ghp_secret_123", string(stdinBytes))
+		}
+	})
+
+	t.Run("returns error when gh secret set fails", func(t *testing.T) {
+		setupMockGH(t, "echo 'failed to set secret' >&2\nexit 1")
+		cfg := &Config{
+			RootDir: t.TempDir(),
+			Repo:    "brotherlogic/test-repo",
+		}
+		err := SetRepoSecret(context.Background(), cfg, "PERSONAL_TOKEN", "ghp_secret_123")
+		if err == nil {
+			t.Fatalf("expected error when gh secret set fails, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to set secret") {
+			t.Errorf("expected error to contain stderr output, got: %v", err)
+		}
+	})
+}
+
+func TestEnsurePersonalToken(t *testing.T) {
+	tests := []struct {
+		name              string
+		force             bool
+		secretExists      bool
+		secretExistsErr   error
+		activeToken       string
+		resolveTokenErr   error
+		validateTokens    map[string]error
+		confirmPrompt     bool
+		fallbackToken     string
+		readPromptErr     error
+		setSecretErr      error
+		wantSetCalled     bool
+		wantSetToken      string
+		wantConfirmCalled bool
+		wantReadCalled    bool
+		wantErr           bool
+		wantErrSubstr     string
+	}{
+		{
+			name:          "1a. PERSONAL_TOKEN already exists and !Force skips provisioning",
+			force:         false,
+			secretExists:  true,
+			wantSetCalled: false,
+		},
+		{
+			name:          "1b. PERSONAL_TOKEN already exists and Force re-provisions with valid active token",
+			force:         true,
+			secretExists:  true,
+			activeToken:   "ghp_active_valid",
+			wantSetCalled: true,
+			wantSetToken:  "ghp_active_valid",
+		},
+		{
+			name:              "2. Valid active token + Force == true sets secret without prompting",
+			force:             true,
+			secretExists:      false,
+			activeToken:       "ghp_active_valid",
+			wantSetCalled:     true,
+			wantSetToken:      "ghp_active_valid",
+			wantConfirmCalled: false,
+			wantReadCalled:    false,
+		},
+		{
+			name:              "3. Valid active token + user confirms prompt sets secret",
+			force:             false,
+			secretExists:      false,
+			activeToken:       "ghp_active_valid",
+			confirmPrompt:     true,
+			wantConfirmCalled: true,
+			wantReadCalled:    false,
+			wantSetCalled:     true,
+			wantSetToken:      "ghp_active_valid",
+		},
+		{
+			name:              "4. Valid active token + user declines prompt falls back to ReadTokenPromptFunc, validates, and sets secret",
+			force:             false,
+			secretExists:      false,
+			activeToken:       "ghp_active_valid",
+			confirmPrompt:     false,
+			fallbackToken:     "ghp_fallback_valid",
+			wantConfirmCalled: true,
+			wantReadCalled:    true,
+			wantSetCalled:     true,
+			wantSetToken:      "ghp_fallback_valid",
+		},
+		{
+			name:         "5. Missing or under-scoped active token reports missing scopes, prompts via ReadTokenPromptFunc, validates, and sets secret",
+			force:        false,
+			secretExists: false,
+			activeToken:  "ghp_underscoped",
+			validateTokens: map[string]error{
+				"ghp_underscoped":    errors.New("token is missing required scopes: workflow"),
+				"ghp_fallback_valid": nil,
+			},
+			fallbackToken:     "ghp_fallback_valid",
+			wantConfirmCalled: false,
+			wantReadCalled:    true,
+			wantSetCalled:     true,
+			wantSetToken:      "ghp_fallback_valid",
+		},
+		{
+			name:         "6a. Invalid fallback PAT returns actionable error",
+			force:        false,
+			secretExists: false,
+			activeToken:  "ghp_underscoped",
+			validateTokens: map[string]error{
+				"ghp_underscoped":      errors.New("token is missing required scopes: workflow"),
+				"ghp_fallback_invalid": errors.New("token is missing required scopes: repo, workflow"),
+			},
+			fallbackToken:  "ghp_fallback_invalid",
+			wantReadCalled: true,
+			wantSetCalled:  false,
+			wantErr:        true,
+			wantErrSubstr:  "missing required scopes: repo, workflow",
+		},
+		{
+			name:           "6b. Empty fallback input returns actionable error",
+			force:          false,
+			secretExists:   false,
+			resolveTokenErr: errors.New("no active token"),
+			fallbackToken:  "   ",
+			wantReadCalled: true,
+			wantSetCalled:  false,
+			wantErr:        true,
+			wantErrSubstr:  "no token provided",
+		},
+		{
+			name:         "6c. Non-interactive Force mode with invalid active token returns actionable error",
+			force:        true,
+			secretExists: false,
+			activeToken:  "ghp_underscoped",
+			validateTokens: map[string]error{
+				"ghp_underscoped": errors.New("token is missing required scopes: workflow"),
+			},
+			wantSetCalled: false,
+			wantErr:       true,
+			wantErrSubstr: "workflow",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var setCalled, confirmCalled, readCalled bool
+			var setName, setToken string
+
+			cfg := &Config{
+				Repo:  "brotherlogic/test-repo",
+				Force: tc.force,
+				CheckSecretExistsFunc: func(ctx context.Context, cfg *Config, secretName string) (bool, error) {
+					return tc.secretExists, tc.secretExistsErr
+				},
+				ResolveActiveTokenFunc: func(ctx context.Context, cfg *Config) (string, error) {
+					if tc.resolveTokenErr != nil {
+						return "", tc.resolveTokenErr
+					}
+					return tc.activeToken, nil
+				},
+				ValidateTokenScopesFunc: func(ctx context.Context, cfg *Config, token string) error {
+					if tc.validateTokens != nil {
+						if err, ok := tc.validateTokens[token]; ok {
+							return err
+						}
+					}
+					return nil
+				},
+				ConfirmTokenPromptFunc: func(repo string) bool {
+					confirmCalled = true
+					return tc.confirmPrompt
+				},
+				ReadTokenPromptFunc: func(repo string) (string, error) {
+					readCalled = true
+					return tc.fallbackToken, tc.readPromptErr
+				},
+				SetRepoSecretFunc: func(ctx context.Context, cfg *Config, secretName, secretValue string) error {
+					setCalled = true
+					setName = secretName
+					setToken = secretValue
+					return tc.setSecretErr
+				},
+			}
+
+			err := EnsurePersonalToken(context.Background(), cfg)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if tc.wantErrSubstr != "" && !strings.Contains(err.Error(), tc.wantErrSubstr) {
+					t.Errorf("expected error to contain %q, got %v", tc.wantErrSubstr, err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if confirmCalled != tc.wantConfirmCalled {
+				t.Errorf("confirmCalled = %v, want %v", confirmCalled, tc.wantConfirmCalled)
+			}
+			if readCalled != tc.wantReadCalled {
+				t.Errorf("readCalled = %v, want %v", readCalled, tc.wantReadCalled)
+			}
+			if setCalled != tc.wantSetCalled {
+				t.Errorf("setCalled = %v, want %v", setCalled, tc.wantSetCalled)
+			}
+			if tc.wantSetCalled {
+				if setName != "PERSONAL_TOKEN" {
+					t.Errorf("expected secret name PERSONAL_TOKEN, got %q", setName)
+				}
+				if setToken != tc.wantSetToken {
+					t.Errorf("expected secret token %q, got %q", tc.wantSetToken, setToken)
+				}
+			}
+		})
+	}
+}
+
+func TestRun_EnsurePersonalTokenFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	branchCreated := false
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/test-repo",
+		Force:   true,
+		CheckPermissionsFunc: func(ctx context.Context, cfg *Config) (RepoPermissions, error) {
+			return RepoPermissions{Admin: true, Push: true}, nil
+		},
+		ConfigureRepoFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		ConfigureWorkflowPermissionsFunc: func(ctx context.Context, cfg *Config) error {
+			return nil
+		},
+		EnsurePersonalTokenFunc: func(ctx context.Context, cfg *Config) error {
+			return errors.New("missing workflow scope")
+		},
+		CommitAndPushBranchFunc: func(ctx context.Context, cfg *Config, branchName string) error {
+			branchCreated = true
+			return nil
+		},
+	}
+
+	err := Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected Run to fail when EnsurePersonalToken fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed ensuring PERSONAL_TOKEN secret") {
+		t.Errorf("expected error to mention 'failed ensuring PERSONAL_TOKEN secret', got: %v", err)
+	}
+	if branchCreated {
+		t.Errorf("expected branch push not to run when EnsurePersonalToken fails")
+	}
+}
+
 
 
