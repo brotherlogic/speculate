@@ -2,6 +2,7 @@ package enroll
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -16,13 +17,16 @@ import (
 	"github.com/brotherlogic/speculate/pkg/pstore"
 	"github.com/brotherlogic/speculate/pkg/synthesizer"
 	pb "github.com/brotherlogic/speculate/proto"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // Pipeline orchestrates repository enrollment: cloning, spec validation,
 // alignment evaluation, label ensuring, README badge updating, and scenario card dispatch.
 type Pipeline struct {
+	sf                  singleflight.Group
 	githubClientFactory func(token, owner, repo string) ghclient.Client
 	evaluator           *evaluator.Evaluator
 	synthesizer         *synthesizer.Synthesizer
@@ -67,6 +71,14 @@ func (p *Pipeline) WithCloneFn(fn func(ctx context.Context, repoURL, targetDir s
 	return p
 }
 
+// ListEnrollments returns all tracked repository enrollment records from storage.
+func (p *Pipeline) ListEnrollments(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+	if p.store == nil {
+		return nil, nil
+	}
+	return p.store.ListEnrollments(ctx)
+}
+
 func defaultClone(ctx context.Context, repoURL, targetDir string) error {
 	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", repoURL, targetDir)
 	out, err := cmd.CombinedOutput()
@@ -76,7 +88,8 @@ func defaultClone(ctx context.Context, repoURL, targetDir string) error {
 	return nil
 }
 
-// Enroll orchestrates the enrollment of a repository into Speculate.
+// Enroll orchestrates the enrollment of a repository into Speculate, deduplicating
+// concurrent evaluations for the same canonical repository via singleflight.
 func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse, error) {
 	// 1. Parse and validate <owner>/<repo>
 	owner, repoName, err := ghclient.ParseRepo(repo)
@@ -85,10 +98,80 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 	}
 	canonicalRepo := fmt.Sprintf("%s/%s", owner, repoName)
 
+	res, err, _ := p.sf.Do(canonicalRepo, func() (any, error) {
+		return p.enrollOnce(ctx, owner, repoName, canonicalRepo)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp, ok := res.(*pb.EnrollResponse)
+	if !ok {
+		return nil, status.Error(codes.Internal, "unexpected response type from pipeline")
+	}
+	return proto.Clone(resp).(*pb.EnrollResponse), nil
+}
+
+func (p *Pipeline) enrollOnce(ctx context.Context, owner, repoName, canonicalRepo string) (*pb.EnrollResponse, error) {
+	now := time.Now().Unix()
+	enrolledAt := now
+	priorStage := pb.LifecycleStage_LIFECYCLE_STAGE_EVALUATING
+	var priorAlignment int32
+	var priorIssueURL string
+	priorStatusMsg := "evaluating repository"
+
+	if p.store != nil {
+		existing, getErr := p.store.GetEnrollment(ctx, canonicalRepo)
+		if getErr == nil && existing != nil {
+			if existing.GetEnrolledAtUnix() > 0 {
+				enrolledAt = existing.GetEnrolledAtUnix()
+			}
+			if existing.GetStage() != pb.LifecycleStage_LIFECYCLE_STAGE_UNSPECIFIED {
+				priorStage = existing.GetStage()
+			}
+			priorAlignment = existing.GetAlignmentPercentage()
+			priorIssueURL = existing.GetIssueUrl()
+			if existing.GetStatusMessage() != "" {
+				priorStatusMsg = existing.GetStatusMessage()
+			}
+		} else if errors.Is(getErr, pstore.ErrNotFound) || (getErr == nil && existing == nil) {
+			initialRecord := &pb.EnrollmentRecord{
+				Repository:          canonicalRepo,
+				AlignmentPercentage: 0,
+				IssueUrl:            "",
+				EnrolledAtUnix:      enrolledAt,
+				LastEvaluatedAtUnix: now,
+				StatusMessage:       "evaluating repository",
+				Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_EVALUATING,
+				LastError:           "",
+			}
+			if saveErr := p.store.SaveEnrollment(ctx, initialRecord); saveErr != nil {
+				return nil, fmt.Errorf("persisting initial enrollment record: %w", saveErr)
+			}
+		}
+	}
+
+	recordFault := func(checkErr error) (*pb.EnrollResponse, error) {
+		if p.store != nil {
+			faultRecord := &pb.EnrollmentRecord{
+				Repository:          canonicalRepo,
+				AlignmentPercentage: priorAlignment,
+				IssueUrl:            priorIssueURL,
+				EnrolledAtUnix:      enrolledAt,
+				LastEvaluatedAtUnix: time.Now().Unix(),
+				StatusMessage:       priorStatusMsg,
+				Stage:               priorStage,
+				LastError:           checkErr.Error(),
+			}
+			_ = p.store.SaveEnrollment(ctx, faultRecord)
+		}
+		return nil, checkErr
+	}
+
 	// 2. Shallow clone repository to temporary directory
 	tempDir, err := os.MkdirTemp("", "speculate-enroll-*")
 	if err != nil {
-		return nil, fmt.Errorf("creating temp directory for clone: %w", err)
+		return recordFault(fmt.Errorf("creating temp directory for clone: %w", err))
 	}
 	defer os.RemoveAll(tempDir)
 
@@ -103,7 +186,7 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 	}
 
 	if err := cloneFunc(ctx, cloneURL, tempDir); err != nil {
-		return nil, fmt.Errorf("cloning repository %s: %w", canonicalRepo, err)
+		return recordFault(fmt.Errorf("cloning repository %s: %w", canonicalRepo, err))
 	}
 
 	// 3a. Verify seed .proto presence in proto/
@@ -128,101 +211,74 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 		}
 		return nil
 	})
-	if !hasProto {
-		return nil, status.Errorf(codes.InvalidArgument, "no valid seed .proto files found in proto/ for %s", canonicalRepo)
-	}
 
 	// 3b. Verify specs/ directory exists and parse spec files with parser.ParseSpecFile
 	specsDir := filepath.Join(tempDir, "specs")
+	var combinedSpec *parser.Specification
+	specsMissingOrEmpty := false
+
 	specEntries, err := os.ReadDir(specsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, status.Errorf(codes.InvalidArgument, "specs/ directory not found in repository %s", canonicalRepo)
-		}
-		return nil, fmt.Errorf("reading specs/ directory: %w", err)
-	}
-
-	var combinedSpec *parser.Specification
-	for _, entry := range specEntries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || info.Size() == 0 {
-			continue
-		}
-		specFilePath := filepath.Join(specsDir, entry.Name())
-		s, err := parser.ParseSpecFile(specFilePath)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "failed to parse spec file %s: %v", entry.Name(), err)
-		}
-		if combinedSpec == nil {
-			combinedSpec = s
+			specsMissingOrEmpty = true
 		} else {
-			combinedSpec.Stages = append(combinedSpec.Stages, s.Stages...)
+			return recordFault(fmt.Errorf("reading specs/ directory: %w", err))
+		}
+	} else {
+		nonEmptySpecFiles := 0
+		for _, entry := range specEntries {
+			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(entry.Name(), ".md") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return recordFault(fmt.Errorf("reading spec file info %s: %w", entry.Name(), err))
+			}
+			if info.Size() == 0 {
+				continue
+			}
+			nonEmptySpecFiles++
+			specFilePath := filepath.Join(specsDir, entry.Name())
+			s, err := parser.ParseSpecFile(specFilePath)
+			if err != nil {
+				return recordFault(status.Errorf(codes.InvalidArgument, "failed to parse spec file %s: %v", entry.Name(), err))
+			}
+			if combinedSpec == nil {
+				combinedSpec = s
+			} else {
+				combinedSpec.Stages = append(combinedSpec.Stages, s.Stages...)
+			}
+		}
+
+		if nonEmptySpecFiles == 0 {
+			specsMissingOrEmpty = true
+		} else if combinedSpec == nil || len(combinedSpec.Stages) == 0 || combinedSpec.TotalRequirements() == 0 {
+			return recordFault(status.Errorf(codes.InvalidArgument, "no valid specification files found in specs/ for %s", canonicalRepo))
 		}
 	}
 
-	if combinedSpec == nil || len(combinedSpec.Stages) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "no valid specification files found in specs/ for %s", canonicalRepo)
-	}
-
-	// 3c. Auto-close open speculate-seed issue when seed files are verified
 	gh := p.githubClientFactory(p.token, owner, repoName)
-	seedIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelSeed)
-	if err != nil {
-		return nil, fmt.Errorf("checking for open seed issue: %w", err)
-	}
-	if seedIssue != nil {
-		commentBody := "Seed protobuf and specification files detected on `main`. Closing this tracking issue and initiating the Speculate autonomous alignment loop."
-		if err := gh.AddIssueComment(ctx, seedIssue.Number, commentBody); err != nil {
-			return nil, fmt.Errorf("commenting on seed issue #%d: %w", seedIssue.Number, err)
+
+	// Record AWAITING_SEED when seed proto or spec files are not yet present
+	if !hasProto || specsMissingOrEmpty {
+		seedIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelSeed)
+		if err != nil {
+			return recordFault(fmt.Errorf("checking for open seed issue: %w", err))
 		}
-		if err := gh.CloseIssue(ctx, seedIssue.Number); err != nil {
-			return nil, fmt.Errorf("closing seed issue #%d: %w", seedIssue.Number, err)
+		seedIssueURL := ""
+		if seedIssue != nil {
+			seedIssueURL = seedIssue.HTMLURL
 		}
-	}
 
-	// 4. Parse test scenarios from tests/ using parser.ParseTestDir
-	testsDir := filepath.Join(tempDir, "tests")
-	suite, err := parser.ParseTestDir(testsDir)
-	if err != nil {
-		return nil, fmt.Errorf("parsing tests directory: %w", err)
-	}
-
-	// 5. Evaluate alignment score using evaluator.Evaluate(ctx, spec, suite)
-	evalResult, err := p.evaluator.Evaluate(ctx, combinedSpec, suite)
-	if err != nil {
-		return nil, fmt.Errorf("evaluating alignment: %w", err)
-	}
-
-	// 6. Ensure required labels exist on the repository using ghClient.EnsureLabels
-	if err := gh.EnsureLabels(ctx, ghclient.RequiredLabels()); err != nil {
-		return nil, fmt.Errorf("ensuring labels on %s: %w", canonicalRepo, err)
-	}
-
-	// 7. Update README badge on main branch using ghClient.UpdateReadmeBadge
-	if err := gh.UpdateReadmeBadge(ctx, "main", evalResult.BadgeMarkdown); err != nil {
-		return nil, fmt.Errorf("updating README badge on %s: %w", canonicalRepo, err)
-	}
-
-	now := time.Now().Unix()
-	enrolledAt := now
-	if p.store != nil {
-		if existing, err := p.store.GetEnrollment(ctx, canonicalRepo); err == nil && existing != nil && existing.GetEnrolledAtUnix() > 0 {
-			enrolledAt = existing.GetEnrolledAtUnix()
-		}
-	}
-
-	// 8. If evalResult.Percentage == 100:
-	if evalResult.Percentage == 100 {
 		record := &pb.EnrollmentRecord{
 			Repository:          canonicalRepo,
-			AlignmentPercentage: 100,
-			IssueUrl:            "",
+			AlignmentPercentage: 0,
+			IssueUrl:            seedIssueURL,
 			EnrolledAtUnix:      enrolledAt,
-			LastEvaluatedAtUnix: now,
-			StatusMessage:       "fully aligned (100%)",
+			LastEvaluatedAtUnix: time.Now().Unix(),
+			StatusMessage:       "awaiting initial seed proto and spec files",
+			Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_SEED,
+			LastError:           "",
 		}
 		if p.store != nil {
 			if err := p.store.SaveEnrollment(ctx, record); err != nil {
@@ -232,70 +288,147 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 
 		return &pb.EnrollResponse{
 			Repository:          canonicalRepo,
-			AlignmentPercentage: 100,
-			IssueUrl:            "",
-			StatusMessage:       "repository enrolled: fully aligned (100%)",
+			AlignmentPercentage: 0,
+			IssueUrl:            seedIssueURL,
+			StatusMessage:       "repository enrolled: awaiting initial seed proto and spec files",
+			Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_SEED,
+			LastError:           "",
 		}, nil
 	}
 
-	// 9. If evalResult.Percentage < 100:
-	var issueURL string
-
-	existingIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelAgenticLoop)
+	// 3c. Auto-close open speculate-seed issue when seed files are verified
+	seedIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelSeed)
 	if err != nil {
-		return nil, fmt.Errorf("checking for existing open issue with label %s: %w", ghclient.LabelAgenticLoop, err)
+		return recordFault(fmt.Errorf("checking for open seed issue: %w", err))
+	}
+	if seedIssue != nil {
+		commentBody := "Seed protobuf and specification files detected on `main`. Closing this tracking issue and initiating the Speculate autonomous alignment loop."
+		if err := gh.AddIssueComment(ctx, seedIssue.Number, commentBody); err != nil {
+			return recordFault(fmt.Errorf("commenting on seed issue #%d: %w", seedIssue.Number, err))
+		}
+		if err := gh.CloseIssue(ctx, seedIssue.Number); err != nil {
+			return recordFault(fmt.Errorf("closing seed issue #%d: %w", seedIssue.Number, err))
+		}
 	}
 
-	if existingIssue != nil {
-		issueURL = existingIssue.HTMLURL
-	} else {
-		// Discover frontier stage and next unexercised requirement
-		stage := evalResult.ActiveFrontierStage
-		req := evalResult.NextRequirement
+	// 4. Parse test scenarios from tests/ using parser.ParseTestDir
+	testsDir := filepath.Join(tempDir, "tests")
+	suite, err := parser.ParseTestDir(testsDir)
+	if err != nil {
+		return recordFault(fmt.Errorf("parsing tests directory: %w", err))
+	}
 
-		if stage == nil || req == nil {
-			for _, st := range combinedSpec.Stages {
-				for _, r := range st.Requirements {
-					if status, ok := evalResult.RequirementStatuses[r.ID]; !ok || !status.Covered {
-						stage = st
-						req = r
-						break
+	// 5. Evaluate alignment score using evaluator.Evaluate(ctx, spec, suite)
+	evalResult, err := p.evaluator.Evaluate(ctx, combinedSpec, suite)
+	if err != nil {
+		return recordFault(fmt.Errorf("evaluating alignment: %w", err))
+	}
+
+	// 6. Ensure required labels exist on the repository using ghClient.EnsureLabels
+	if err := gh.EnsureLabels(ctx, ghclient.RequiredLabels()); err != nil {
+		return recordFault(fmt.Errorf("ensuring labels on %s: %w", canonicalRepo, err))
+	}
+
+	// 7. Update README badge on main branch using ghClient.UpdateReadmeBadge
+	if err := gh.UpdateReadmeBadge(ctx, "main", evalResult.BadgeMarkdown); err != nil {
+		return recordFault(fmt.Errorf("updating README badge on %s: %w", canonicalRepo, err))
+	}
+
+	// 8. Resolve active lifecycle stage in priority order:
+	//    1) STALLED -> 2) ALIGNING -> 3) ALIGNED (100%) -> 4) AWAITING_TEST_REVIEW (<100%)
+	var resolvedStage pb.LifecycleStage
+	var issueURL string
+	var recordStatusMsg string
+	var respStatusMsg string
+
+	stalledIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelStalled)
+	if err != nil {
+		return recordFault(fmt.Errorf("checking for open issue with label %s: %w", ghclient.LabelStalled, err))
+	}
+
+	if stalledIssue != nil {
+		resolvedStage = pb.LifecycleStage_LIFECYCLE_STAGE_STALLED
+		issueURL = stalledIssue.HTMLURL
+		recordStatusMsg = fmt.Sprintf("alignment stalled (%d%%)", evalResult.Percentage)
+		respStatusMsg = fmt.Sprintf("repository enrolled: alignment stalled (%d%%)", evalResult.Percentage)
+	} else {
+		alignIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelAlign)
+		if err != nil {
+			return recordFault(fmt.Errorf("checking for open issue with label %s: %w", ghclient.LabelAlign, err))
+		}
+
+		if alignIssue != nil {
+			resolvedStage = pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNING
+			issueURL = alignIssue.HTMLURL
+			recordStatusMsg = fmt.Sprintf("aligning (%d%%)", evalResult.Percentage)
+			respStatusMsg = fmt.Sprintf("repository enrolled: aligning (%d%%)", evalResult.Percentage)
+		} else if evalResult.Percentage == 100 {
+			resolvedStage = pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED
+			issueURL = ""
+			recordStatusMsg = "fully aligned (100%)"
+			respStatusMsg = "repository enrolled: fully aligned (100%)"
+		} else {
+			existingIssue, err := gh.FindOpenIssueByLabel(ctx, ghclient.LabelAgenticLoop)
+			if err != nil {
+				return recordFault(fmt.Errorf("checking for existing open issue with label %s: %w", ghclient.LabelAgenticLoop, err))
+			}
+
+			if existingIssue != nil {
+				issueURL = existingIssue.HTMLURL
+			} else {
+				// Discover frontier stage and next unexercised requirement
+				stage := evalResult.ActiveFrontierStage
+				req := evalResult.NextRequirement
+
+				if stage == nil || req == nil {
+					for _, st := range combinedSpec.Stages {
+						for _, r := range st.Requirements {
+							if stStatus, ok := evalResult.RequirementStatuses[r.ID]; !ok || !stStatus.Covered {
+								stage = st
+								req = r
+								break
+							}
+						}
+						if stage != nil && req != nil {
+							break
+						}
 					}
 				}
-				if stage != nil && req != nil {
-					break
+
+				if stage == nil || req == nil {
+					stage = combinedSpec.Stages[0]
+					req = stage.Requirements[0]
 				}
+
+				protoContract := findProtoContracts(tempDir)
+
+				card, err := p.synthesizer.GenerateScenarioCard(ctx, stage, req, protoContract)
+				if err != nil {
+					return recordFault(fmt.Errorf("generating scenario card: %w", err))
+				}
+
+				scenarioName := card.Title
+				if scenarioName == "" {
+					scenarioName = card.ID
+				}
+				issueTitle := fmt.Sprintf("[Speculate Loop] Add integration test for %s", scenarioName)
+
+				createdIssue, err := gh.CreateIssue(ctx, &ghclient.CreateIssueRequest{
+					Title:  issueTitle,
+					Body:   card.FormatMarkdown(),
+					Labels: []string{ghclient.LabelAgenticLoop},
+				})
+				if err != nil {
+					return recordFault(fmt.Errorf("creating scenario card issue: %w", err))
+				}
+
+				issueURL = createdIssue.HTMLURL
 			}
+
+			resolvedStage = pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_TEST_REVIEW
+			recordStatusMsg = fmt.Sprintf("alignment %d%%", evalResult.Percentage)
+			respStatusMsg = fmt.Sprintf("repository enrolled with %d%% alignment", evalResult.Percentage)
 		}
-
-		if stage == nil || req == nil {
-			stage = combinedSpec.Stages[0]
-			req = stage.Requirements[0]
-		}
-
-		protoContract := findProtoContracts(tempDir)
-
-		card, err := p.synthesizer.GenerateScenarioCard(ctx, stage, req, protoContract)
-		if err != nil {
-			return nil, fmt.Errorf("generating scenario card: %w", err)
-		}
-
-		scenarioName := card.Title
-		if scenarioName == "" {
-			scenarioName = card.ID
-		}
-		issueTitle := fmt.Sprintf("[Speculate Loop] Add integration test for %s", scenarioName)
-
-		createdIssue, err := gh.CreateIssue(ctx, &ghclient.CreateIssueRequest{
-			Title:  issueTitle,
-			Body:   card.FormatMarkdown(),
-			Labels: []string{ghclient.LabelAgenticLoop},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("creating scenario card issue: %w", err)
-		}
-
-		issueURL = createdIssue.HTMLURL
 	}
 
 	record := &pb.EnrollmentRecord{
@@ -303,8 +436,10 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 		AlignmentPercentage: int32(evalResult.Percentage),
 		IssueUrl:            issueURL,
 		EnrolledAtUnix:      enrolledAt,
-		LastEvaluatedAtUnix: now,
-		StatusMessage:       fmt.Sprintf("alignment %d%%", evalResult.Percentage),
+		LastEvaluatedAtUnix: time.Now().Unix(),
+		StatusMessage:       recordStatusMsg,
+		Stage:               resolvedStage,
+		LastError:           "",
 	}
 	if p.store != nil {
 		if err := p.store.SaveEnrollment(ctx, record); err != nil {
@@ -316,7 +451,9 @@ func (p *Pipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse,
 		Repository:          canonicalRepo,
 		AlignmentPercentage: int32(evalResult.Percentage),
 		IssueUrl:            issueURL,
-		StatusMessage:       fmt.Sprintf("repository enrolled with %d%% alignment", evalResult.Percentage),
+		StatusMessage:       respStatusMsg,
+		Stage:               resolvedStage,
+		LastError:           "",
 	}, nil
 }
 
