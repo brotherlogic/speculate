@@ -3,26 +3,40 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/brotherlogic/speculate/pkg/enroll"
 	"github.com/brotherlogic/speculate/pkg/setup"
 	pb "github.com/brotherlogic/speculate/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
+var (
+	_ EnrollmentPipeline = (*enroll.Pipeline)(nil)
+	_ EnrollmentLister   = (*enroll.Pipeline)(nil)
+	_ EnrollmentPipeline = (*mockPipeline)(nil)
+	_ EnrollmentLister   = (*mockPipeline)(nil)
+)
+
 type mockPipeline struct {
-	enrollFn func(ctx context.Context, repo string) (*pb.EnrollResponse, error)
-	calls    atomic.Int64
+	enrollFn  func(ctx context.Context, repo string) (*pb.EnrollResponse, error)
+	listFn    func(ctx context.Context) ([]*pb.EnrollmentRecord, error)
+	calls     atomic.Int64
+	listCalls atomic.Int64
 }
 
 func (m *mockPipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollResponse, error) {
@@ -35,6 +49,14 @@ func (m *mockPipeline) Enroll(ctx context.Context, repo string) (*pb.EnrollRespo
 		AlignmentPercentage: 100,
 		StatusMessage:       "enrolled",
 	}, nil
+}
+
+func (m *mockPipeline) ListEnrollments(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+	m.listCalls.Add(1)
+	if m.listFn != nil {
+		return m.listFn(ctx)
+	}
+	return nil, nil
 }
 
 func TestSpeculateServer_Enroll_Success(t *testing.T) {
@@ -361,4 +383,431 @@ func TestParseInitConfig_CollaboratorFlag(t *testing.T) {
 		}
 	})
 }
+
+func TestSpeculateServer_ListEnrollments(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty list", func(t *testing.T) {
+		mockPipe := &mockPipeline{
+			listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+				return []*pb.EnrollmentRecord{}, nil
+			},
+		}
+		server := NewSpeculateServer(mockPipe)
+
+		resp, err := server.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(resp.GetRecords()) != 0 {
+			t.Errorf("expected 0 records, got %d", len(resp.GetRecords()))
+		}
+		if mockPipe.listCalls.Load() != 1 {
+			t.Errorf("expected 1 list call, got %d", mockPipe.listCalls.Load())
+		}
+	})
+
+	t.Run("populated records", func(t *testing.T) {
+		expected := []*pb.EnrollmentRecord{
+			{
+				Repository:          "brotherlogic/alpha",
+				AlignmentPercentage: 100,
+				Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED,
+				EnrolledAtUnix:      1700000000,
+				LastEvaluatedAtUnix: 1700000300,
+				StatusMessage:       "aligned",
+			},
+			{
+				Repository:          "brotherlogic/beta",
+				AlignmentPercentage: 40,
+				IssueUrl:            "https://github.com/brotherlogic/beta/issues/7",
+				Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_STALLED,
+				EnrolledAtUnix:      1700000100,
+				LastEvaluatedAtUnix: 1700000400,
+				StatusMessage:       "stalled after max retries",
+				LastError:           "rate limit exceeded",
+			},
+		}
+		mockPipe := &mockPipeline{
+			listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+				return expected, nil
+			},
+		}
+		server := NewSpeculateServer(mockPipe)
+
+		resp, err := server.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(resp.GetRecords()) != 2 {
+			t.Fatalf("expected 2 records, got %d", len(resp.GetRecords()))
+		}
+		if resp.GetRecords()[0].GetRepository() != "brotherlogic/alpha" ||
+			resp.GetRecords()[0].GetStage() != pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED {
+			t.Errorf("unexpected first record: %+v", resp.GetRecords()[0])
+		}
+		if resp.GetRecords()[1].GetRepository() != "brotherlogic/beta" ||
+			resp.GetRecords()[1].GetStage() != pb.LifecycleStage_LIFECYCLE_STAGE_STALLED ||
+			resp.GetRecords()[1].GetLastError() != "rate limit exceeded" {
+			t.Errorf("unexpected second record: %+v", resp.GetRecords()[1])
+		}
+	})
+
+	t.Run("error propagation", func(t *testing.T) {
+		mockPipe := &mockPipeline{
+			listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+				return nil, status.Error(codes.Unavailable, "pstore backend unavailable")
+			},
+		}
+		server := NewSpeculateServer(mockPipe)
+
+		_, err := server.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.Unavailable {
+			t.Errorf("expected Unavailable status error, got %v", err)
+		}
+
+		mockPipePlainErr := &mockPipeline{
+			listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+				return nil, errors.New("disk read error")
+			},
+		}
+		serverPlain := NewSpeculateServer(mockPipePlainErr)
+		_, err = serverPlain.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+		if err == nil {
+			t.Fatal("expected error for plain error, got nil")
+		}
+		if st, ok := status.FromError(err); !ok || st.Code() != codes.Internal || !strings.Contains(st.Message(), "disk read error") {
+			t.Errorf("expected Internal status wrapping 'disk read error', got %v", err)
+		}
+	})
+}
+
+func TestSpeculateServer_ListEnrollments_Bufconn(t *testing.T) {
+	ctx := context.Background()
+	lis := bufconn.Listen(1024 * 1024)
+	defer lis.Close()
+
+	var currentFn atomic.Value
+	mockPipe := &mockPipeline{
+		listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+			fn := currentFn.Load().(func(context.Context) ([]*pb.EnrollmentRecord, error))
+			return fn(ctx)
+		},
+	}
+
+	s := grpc.NewServer()
+	pb.RegisterSpeculateServiceServer(s, NewSpeculateServer(mockPipe))
+	go func() {
+		_ = s.Serve(lis)
+	}()
+	defer s.Stop()
+
+	conn, err := grpc.NewClient(
+		"passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial bufconn: %v", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewSpeculateServiceClient(conn)
+
+	// 1. Empty list over bufconn
+	currentFn.Store(func(context.Context) ([]*pb.EnrollmentRecord, error) {
+		return nil, nil
+	})
+	emptyResp, err := client.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+	if err != nil {
+		t.Fatalf("bufconn empty ListEnrollments failed: %v", err)
+	}
+	if len(emptyResp.GetRecords()) != 0 {
+		t.Errorf("expected 0 records over bufconn, got %d", len(emptyResp.GetRecords()))
+	}
+
+	// 2. Populated records over bufconn
+	currentFn.Store(func(context.Context) ([]*pb.EnrollmentRecord, error) {
+		return []*pb.EnrollmentRecord{
+			{
+				Repository:          "brotherlogic/speculate-kv",
+				AlignmentPercentage: 60,
+				IssueUrl:            "https://github.com/brotherlogic/speculate-kv/issues/12",
+				Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_TEST_REVIEW,
+				StatusMessage:       "scenario card proposed",
+				LastError:           "transient github timeout",
+			},
+		}, nil
+	})
+	popResp, err := client.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+	if err != nil {
+		t.Fatalf("bufconn populated ListEnrollments failed: %v", err)
+	}
+	if len(popResp.GetRecords()) != 1 {
+		t.Fatalf("expected 1 record over bufconn, got %d", len(popResp.GetRecords()))
+	}
+	rec := popResp.GetRecords()[0]
+	if rec.GetRepository() != "brotherlogic/speculate-kv" ||
+		rec.GetStage() != pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_TEST_REVIEW ||
+		rec.GetLastError() != "transient github timeout" {
+		t.Errorf("unexpected record over bufconn: %+v", rec)
+	}
+
+	// 3. Error propagation over bufconn
+	currentFn.Store(func(context.Context) ([]*pb.EnrollmentRecord, error) {
+		return nil, status.Error(codes.Unavailable, "remote store down")
+	})
+	_, err = client.ListEnrollments(ctx, &pb.ListEnrollmentsRequest{})
+	if err == nil {
+		t.Fatal("expected error over bufconn, got nil")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unavailable {
+		t.Errorf("expected Unavailable over bufconn, got %v", err)
+	}
+}
+
+func TestRunEnroll_StageAndLastErrorFormatting(t *testing.T) {
+	tests := []struct {
+		name      string
+		stage     pb.LifecycleStage
+		wantStage string
+		lastError string
+	}{
+		{
+			name:      "awaiting seed without error",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_SEED,
+			wantStage: "Awaiting Seed",
+		},
+		{
+			name:      "evaluating without error",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_EVALUATING,
+			wantStage: "Evaluating",
+		},
+		{
+			name:      "awaiting test review without error",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_TEST_REVIEW,
+			wantStage: "Awaiting Test Review",
+		},
+		{
+			name:      "aligning without error",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNING,
+			wantStage: "Aligning",
+		},
+		{
+			name:      "stalled with last error",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_STALLED,
+			wantStage: "Stalled",
+			lastError: "git clone failed: authentication required",
+		},
+		{
+			name:      "aligned without error",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED,
+			wantStage: "Aligned",
+		},
+		{
+			name:      "unspecified stage",
+			stage:     pb.LifecycleStage_LIFECYCLE_STAGE_UNSPECIFIED,
+			wantStage: "Unspecified",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lis := bufconn.Listen(1024 * 1024)
+			defer lis.Close()
+
+			mockPipe := &mockPipeline{
+				enrollFn: func(ctx context.Context, repo string) (*pb.EnrollResponse, error) {
+					return &pb.EnrollResponse{
+						Repository:          repo,
+						AlignmentPercentage: 50,
+						IssueUrl:            "https://github.com/brotherlogic/test/issues/1",
+						StatusMessage:       "checked",
+						Stage:               tc.stage,
+						LastError:           tc.lastError,
+					}, nil
+				},
+			}
+
+			s := grpc.NewServer()
+			pb.RegisterSpeculateServiceServer(s, NewSpeculateServer(mockPipe))
+			go func() {
+				_ = s.Serve(lis)
+			}()
+			defer s.Stop()
+
+			var stdout, stderr bytes.Buffer
+			dialOpt := grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+				return lis.Dial()
+			})
+
+			err := runEnroll(context.Background(), []string{"--daemon-addr", "passthrough://bufnet", "brotherlogic/test"}, &stdout, &stderr, dialOpt)
+			if err != nil {
+				t.Fatalf("runEnroll failed: %v\nstderr: %s", err, stderr.String())
+			}
+
+			out := stdout.String()
+			wantStageLine := fmt.Sprintf("  Stage:        %s\n", tc.wantStage)
+			if !strings.Contains(out, wantStageLine) {
+				t.Errorf("stdout missing %q, got:\n%s", wantStageLine, out)
+			}
+
+			if tc.lastError == "" {
+				if strings.Contains(out, "Last Error:") {
+					t.Errorf("expected no Last Error line when LastError is empty, got:\n%s", out)
+				}
+			} else {
+				wantErrLine := fmt.Sprintf("  Last Error:   %s\n", tc.lastError)
+				if !strings.Contains(out, wantErrLine) {
+					t.Errorf("stdout missing %q, got:\n%s", wantErrLine, out)
+				}
+			}
+		})
+	}
+}
+
+func TestParseDaemonConfig_SyncInterval(t *testing.T) {
+	t.Run("defaults to 5m", func(t *testing.T) {
+		t.Setenv("SYNC_INTERVAL", "")
+		cfg := parseDaemonConfig([]string{})
+		if cfg.SyncInterval != 5*time.Minute {
+			t.Errorf("cfg.SyncInterval = %v, want %v", cfg.SyncInterval, 5*time.Minute)
+		}
+	})
+
+	t.Run("reads SYNC_INTERVAL env var", func(t *testing.T) {
+		t.Setenv("SYNC_INTERVAL", "2m30s")
+		cfg := parseDaemonConfig([]string{})
+		want := 2*time.Minute + 30*time.Second
+		if cfg.SyncInterval != want {
+			t.Errorf("cfg.SyncInterval = %v, want %v", cfg.SyncInterval, want)
+		}
+	})
+
+	t.Run("falls back to 5m on invalid or non-positive SYNC_INTERVAL", func(t *testing.T) {
+		for _, bad := range []string{"invalid", "0s", "-1m"} {
+			t.Setenv("SYNC_INTERVAL", bad)
+			cfg := parseDaemonConfig([]string{})
+			if cfg.SyncInterval != 5*time.Minute {
+				t.Errorf("for SYNC_INTERVAL=%q, cfg.SyncInterval = %v, want %v", bad, cfg.SyncInterval, 5*time.Minute)
+			}
+		}
+	})
+
+	t.Run("flag overrides default and env var", func(t *testing.T) {
+		t.Setenv("SYNC_INTERVAL", "3m")
+		cfg := parseDaemonConfig([]string{"--sync-interval=45s"})
+		if cfg.SyncInterval != 45*time.Second {
+			t.Errorf("cfg.SyncInterval = %v, want %v", cfg.SyncInterval, 45*time.Second)
+		}
+	})
+}
+
+func TestInitHTTPMux_Routes(t *testing.T) {
+	cfg := &DaemonConfig{
+		HTTPPort:       8080,
+		GRPCPort:       50051,
+		OllamaEndpoint: "http://localhost:11434/v1",
+		TargetRepo:     "brotherlogic/speculate-kv",
+		SyncInterval:   5 * time.Minute,
+	}
+
+	mockPipe := &mockPipeline{
+		listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+			return []*pb.EnrollmentRecord{
+				{
+					Repository:          "brotherlogic/speculate-kv",
+					Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED,
+					AlignmentPercentage: 100,
+					LastEvaluatedAtUnix: time.Now().Add(-1 * time.Minute).Unix(),
+					StatusMessage:       "aligned",
+				},
+			}, nil
+		},
+	}
+
+	mux := initHTTPMux(cfg, mockPipe)
+
+	t.Run("GET / serves HTML dashboard", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET / status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+			t.Errorf("GET / Content-Type = %q, want text/html prefix", ct)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "brotherlogic/speculate-kv") || !strings.Contains(body, "Aligned") {
+			t.Errorf("GET / body missing expected tracked repository content:\n%s", body)
+		}
+	})
+
+	t.Run("GET /healthz returns 200 OK", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /healthz status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if rec.Body.String() != "OK\n" {
+			t.Errorf("GET /healthz body = %q, want %q", rec.Body.String(), "OK\n")
+		}
+	})
+
+	t.Run("GET /status returns JSON status", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /status status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("GET /status Content-Type = %q, want application/json", ct)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("GET /status returned invalid JSON: %v", err)
+		}
+		if payload["status"] != "running" {
+			t.Errorf("payload[status] = %v, want running", payload["status"])
+		}
+		if payload["target_repo"] != "brotherlogic/speculate-kv" {
+			t.Errorf("payload[target_repo] = %v, want brotherlogic/speculate-kv", payload["target_repo"])
+		}
+	})
+
+	t.Run("GET /metrics serves Prometheus metrics", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /metrics status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if !strings.Contains(rec.Body.String(), "# HELP") {
+			t.Errorf("GET /metrics body missing Prometheus '# HELP' lines")
+		}
+	})
+
+	t.Run("GET /nonexistent returns 404 Not Found", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/nonexistent", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("GET /nonexistent status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+}
+
 

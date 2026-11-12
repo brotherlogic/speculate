@@ -17,6 +17,7 @@ import (
 
 	"github.com/brotherlogic/speculate/pkg/enroll"
 	"github.com/brotherlogic/speculate/pkg/evaluator"
+	ghclient "github.com/brotherlogic/speculate/pkg/github"
 	"github.com/brotherlogic/speculate/pkg/pstore"
 	"github.com/brotherlogic/speculate/pkg/setup"
 	"github.com/brotherlogic/speculate/pkg/synthesizer"
@@ -32,6 +33,7 @@ type DaemonConfig struct {
 	GRPCPort       int
 	OllamaEndpoint string
 	TargetRepo     string
+	SyncInterval   time.Duration
 }
 
 func parseDaemonConfig(args []string) *DaemonConfig {
@@ -63,19 +65,56 @@ func parseDaemonConfig(args []string) *DaemonConfig {
 		targetRepo = "brotherlogic/speculate-kv"
 	}
 
-	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	syncInterval := enroll.DefaultSyncInterval
+	if envSync := os.Getenv("SYNC_INTERVAL"); envSync != "" {
+		if d, err := time.ParseDuration(envSync); err == nil && d > 0 {
+			syncInterval = d
+		}
+	}
+
+	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.IntVar(&httpPort, "http-port", httpPort, "HTTP server port")
 	fs.IntVar(&grpcPort, "grpc-port", grpcPort, "gRPC server port")
 	fs.StringVar(&ollamaEndpoint, "ollama-endpoint", ollamaEndpoint, "Ollama LLM API endpoint")
 	fs.StringVar(&targetRepo, "target-repo", targetRepo, "Target repository (owner/repo)")
+	fs.DurationVar(&syncInterval, "sync-interval", syncInterval, "Interval between collaborator discovery sync cycles")
 	_ = fs.Parse(args)
+	if syncInterval <= 0 {
+		syncInterval = enroll.DefaultSyncInterval
+	}
 
 	return &DaemonConfig{
 		HTTPPort:       httpPort,
 		GRPCPort:       grpcPort,
 		OllamaEndpoint: ollamaEndpoint,
 		TargetRepo:     targetRepo,
+		SyncInterval:   syncInterval,
 	}
+}
+
+func initHTTPMux(cfg *DaemonConfig, lister EnrollmentLister) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/", NewDashboardHandler(lister))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK\n"))
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var targetRepo, ollamaEndpoint string
+		if cfg != nil {
+			targetRepo = cfg.TargetRepo
+			ollamaEndpoint = cfg.OllamaEndpoint
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":          "running",
+			"target_repo":     targetRepo,
+			"ollama_endpoint": ollamaEndpoint,
+			"timestamp":       time.Now().UTC().Format(time.RFC3339),
+		})
+	})
+	mux.Handle("/metrics", promhttp.Handler())
+	return mux
 }
 
 func runDaemon(args []string) {
@@ -106,8 +145,8 @@ func runDaemon(args []string) {
 			log.Printf("Warning: failed to connect to pstore at %s: %v; falling back to in-memory store", pstoreAddr, err)
 			store = pstore.NewMockStore()
 		} else {
-			store = pstoreClient
 			defer pstoreClient.Close()
+			store = pstore.NewFallbackStore(pstoreClient, pstore.NewMockStore())
 		}
 	} else {
 		store = pstore.NewMockStore()
@@ -126,6 +165,14 @@ func runDaemon(args []string) {
 	speculateServer := NewSpeculateServer(pipeline)
 	pb.RegisterSpeculateServiceServer(grpcServer, speculateServer)
 
+	if ghToken != "" {
+		accountClient := ghclient.NewRealAccountClient(ghToken)
+		syncer := enroll.NewSyncer(accountClient, store, pipeline)
+		go syncer.Run(ctx, cfg.SyncInterval)
+	} else {
+		log.Printf("Warning: GH_TOKEN / GITHUB_TOKEN not set; automatic collaborator discovery is disabled")
+	}
+
 	go func() {
 		log.Printf("Starting gRPC server on port %d...", cfg.GRPCPort)
 		if err := grpcServer.Serve(grpcLis); err != nil && err != grpc.ErrServerStopped {
@@ -133,22 +180,8 @@ func runDaemon(args []string) {
 		}
 	}()
 
-	// 2. Initialize HTTP server (metrics, healthz, status)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK\n"))
-	})
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":          "running",
-			"target_repo":     cfg.TargetRepo,
-			"ollama_endpoint": cfg.OllamaEndpoint,
-			"timestamp":       time.Now().UTC().Format(time.RFC3339),
-		})
-	})
-	mux.Handle("/metrics", promhttp.Handler())
+	// 2. Initialize HTTP server (dashboard, metrics, healthz, status)
+	mux := initHTTPMux(cfg, pipeline)
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.HTTPPort),
