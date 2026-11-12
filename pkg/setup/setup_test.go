@@ -3392,5 +3392,105 @@ func TestRun_EnsurePersonalTokenFailure(t *testing.T) {
 	}
 }
 
+func TestDefaultCollaborator(t *testing.T) {
+	if DefaultCollaborator != "brotherlogic-speculate" {
+		t.Errorf("DefaultCollaborator = %q, want %q", DefaultCollaborator, "brotherlogic-speculate")
+	}
+}
+
+func TestSetupTemplateFiles_CollaboratorRendering(t *testing.T) {
+	tests := []struct {
+		name             string
+		collaborator     string
+		wantCollaborator string
+	}{
+		{
+			name:             "empty collaborator defaults to brotherlogic-speculate",
+			collaborator:     "",
+			wantCollaborator: "brotherlogic-speculate",
+		},
+		{
+			name:             "whitespace collaborator defaults to brotherlogic-speculate",
+			collaborator:     "   ",
+			wantCollaborator: "brotherlogic-speculate",
+		},
+		{
+			name:             "explicit DefaultCollaborator",
+			collaborator:     DefaultCollaborator,
+			wantCollaborator: "brotherlogic-speculate",
+		},
+		{
+			name:             "custom collaborator trimmed and rendered",
+			collaborator:     "  my-custom-bot  ",
+			wantCollaborator: "my-custom-bot",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			cfg := &Config{
+				RootDir:      tempDir,
+				Repo:         "brotherlogic/sample-repo",
+				Owner:        "brotherlogic",
+				Collaborator: tc.collaborator,
+			}
+
+			if _, err := SetupTemplateFiles(cfg); err != nil {
+				t.Fatalf("SetupTemplateFiles failed: %v", err)
+			}
+
+			reviewGateBytes, err := os.ReadFile(filepath.Join(tempDir, ".github", "workflows", "review-gate.yml"))
+			if err != nil {
+				t.Fatalf("reading review-gate.yml failed: %v", err)
+			}
+			reviewGateStr := string(reviewGateBytes)
+
+			wantCheck := `if [ "$PR_AUTHOR" = "brotherlogic" ] || [ "$PR_AUTHOR" = "` + tc.wantCollaborator + `" ] || [ "$PR_AUTHOR" = "brotherlogic-automation" ]; then`
+			if !strings.Contains(reviewGateStr, wantCheck) {
+				t.Errorf("expected review-gate.yml to contain %q, got:\n%s", wantCheck, reviewGateStr)
+			}
+		})
+	}
+}
+
+func TestConfigureCollaborator_EmptyAndConfigured(t *testing.T) {
+	t.Run("empty collaborator skips gh api call", func(t *testing.T) {
+		_, logFile := setupMockGH(t, "exit 1")
+		cfg := &Config{
+			RootDir:      t.TempDir(),
+			Repo:         "brotherlogic/sample-repo",
+			Collaborator: "",
+		}
+		if err := ConfigureCollaborator(context.Background(), cfg); err != nil {
+			t.Fatalf("expected nil error when Collaborator is empty, got: %v", err)
+		}
+		if _, err := os.Stat(logFile); !os.IsNotExist(err) {
+			t.Errorf("expected gh CLI not to be invoked when Collaborator is empty")
+		}
+	})
+
+	t.Run("configured DefaultCollaborator invokes gh api", func(t *testing.T) {
+		_, logFile := setupMockGH(t, "exit 0")
+		cfg := &Config{
+			RootDir:      t.TempDir(),
+			Repo:         "brotherlogic/sample-repo",
+			Collaborator: DefaultCollaborator,
+		}
+		if err := ConfigureCollaborator(context.Background(), cfg); err != nil {
+			t.Fatalf("ConfigureCollaborator failed: %v", err)
+		}
+		loggedBytes, err := os.ReadFile(logFile)
+		if err != nil {
+			t.Fatalf("reading gh_args.log: %v", err)
+		}
+		wantArgs := "api repos/brotherlogic/sample-repo/collaborators/brotherlogic-speculate -X PUT -f permission=push"
+		if !strings.Contains(string(loggedBytes), wantArgs) {
+			t.Errorf("expected gh args to contain %q, got %q", wantArgs, string(loggedBytes))
+		}
+	})
+}
+
+
 
 
