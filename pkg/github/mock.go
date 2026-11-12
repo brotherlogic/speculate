@@ -4,9 +4,16 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+)
+
+var (
+	_ Client        = (*MockClient)(nil)
+	_ AccountClient = (*MockAccountClient)(nil)
 )
 
 // MockClient provides an in-memory implementation of the GitHub Client interface.
@@ -14,11 +21,11 @@ type MockClient struct {
 	mu            sync.RWMutex
 	owner         string
 	repo          string
-	branches      map[string]string                 // branchName -> commitSHA
-	labels        map[string]Label                  // labelName -> Label
-	issues        map[int]*Issue                    // number -> Issue
-	issueComments map[int][]string                  // number -> comment bodies
-	prs           map[int]*PullRequest              // number -> PullRequest
+	branches      map[string]string                  // branchName -> commitSHA
+	labels        map[string]Label                   // labelName -> Label
+	issues        map[int]*Issue                     // number -> Issue
+	issueComments map[int][]string                   // number -> comment bodies
+	prs           map[int]*PullRequest               // number -> PullRequest
 	files         map[string]map[string]*FileContent // ref -> path -> FileContent
 	nextIssueNum  int
 	nextPRNum     int
@@ -426,4 +433,180 @@ func sha1String(s string) string {
 	h := sha1.New()
 	h.Write([]byte(s))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// MockAccountClient provides a thread-safe in-memory implementation of AccountClient.
+type MockAccountClient struct {
+	mu                     sync.RWMutex
+	pendingInvitations     []string
+	collaboratorRepos      map[string]struct{}
+	listInvitationsErr     error
+	acceptInvitationErrors map[string]error
+	listCollaboratorErr    error
+}
+
+// NewMockAccountClient initializes a thread-safe MockAccountClient.
+func NewMockAccountClient() *MockAccountClient {
+	return &MockAccountClient{
+		pendingInvitations:     make([]string, 0),
+		collaboratorRepos:      make(map[string]struct{}),
+		acceptInvitationErrors: make(map[string]error),
+	}
+}
+
+// AddPendingInvitations appends non-empty repository full names ("owner/repo") to pending invitations.
+func (m *MockAccountClient) AddPendingInvitations(repos ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing := make(map[string]struct{}, len(m.pendingInvitations))
+	for _, r := range m.pendingInvitations {
+		existing[r] = struct{}{}
+	}
+	for _, repo := range repos {
+		cleaned := strings.TrimSpace(repo)
+		if cleaned == "" {
+			continue
+		}
+		if _, dup := existing[cleaned]; !dup {
+			m.pendingInvitations = append(m.pendingInvitations, cleaned)
+			existing[cleaned] = struct{}{}
+		}
+	}
+}
+
+// SetPendingInvitations replaces the pending invitation repository list.
+func (m *MockAccountClient) SetPendingInvitations(repos []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.pendingInvitations = make([]string, 0, len(repos))
+	existing := make(map[string]struct{}, len(repos))
+	for _, repo := range repos {
+		cleaned := strings.TrimSpace(repo)
+		if cleaned == "" {
+			continue
+		}
+		if _, dup := existing[cleaned]; !dup {
+			m.pendingInvitations = append(m.pendingInvitations, cleaned)
+			existing[cleaned] = struct{}{}
+		}
+	}
+}
+
+// PendingInvitations returns a defensive copy of currently pending repository invitations.
+func (m *MockAccountClient) PendingInvitations() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	copied := make([]string, len(m.pendingInvitations))
+	copy(copied, m.pendingInvitations)
+	return copied
+}
+
+// AddCollaboratorRepositories seeds active collaborator repository full names ("owner/repo").
+func (m *MockAccountClient) AddCollaboratorRepositories(repos ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, repo := range repos {
+		if cleaned := strings.TrimSpace(repo); cleaned != "" {
+			m.collaboratorRepos[cleaned] = struct{}{}
+		}
+	}
+}
+
+// SetCollaboratorRepositories replaces the active collaborator repository set.
+func (m *MockAccountClient) SetCollaboratorRepositories(repos []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.collaboratorRepos = make(map[string]struct{}, len(repos))
+	for _, repo := range repos {
+		if cleaned := strings.TrimSpace(repo); cleaned != "" {
+			m.collaboratorRepos[cleaned] = struct{}{}
+		}
+	}
+}
+
+// RemoveCollaboratorRepository removes a repository from the active collaborator set.
+func (m *MockAccountClient) RemoveCollaboratorRepository(repo string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.collaboratorRepos, strings.TrimSpace(repo))
+}
+
+// SetListInvitationsError configures an injectable error returned by AcceptPendingInvitations when listing invitations.
+func (m *MockAccountClient) SetListInvitationsError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.listInvitationsErr = err
+}
+
+// SetAcceptInvitationError configures or clears a per-repository invitation acceptance error.
+func (m *MockAccountClient) SetAcceptInvitationError(repo string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleaned := strings.TrimSpace(repo)
+	if err == nil {
+		delete(m.acceptInvitationErrors, cleaned)
+		return
+	}
+	m.acceptInvitationErrors[cleaned] = err
+}
+
+// SetListCollaboratorRepositoriesError configures an injectable error returned by ListCollaboratorRepositories.
+func (m *MockAccountClient) SetListCollaboratorRepositoriesError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.listCollaboratorErr = err
+}
+
+// AcceptPendingInvitations accepts pending invitations, promoting accepted repositories into
+// the active collaborator set unless configured to fail for a given repository.
+func (m *MockAccountClient) AcceptPendingInvitations(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.listInvitationsErr != nil {
+		return nil, m.listInvitationsErr
+	}
+
+	accepted := make([]string, 0, len(m.pendingInvitations))
+	remaining := make([]string, 0)
+	var errs []error
+
+	for _, repo := range m.pendingInvitations {
+		if acceptErr, shouldFail := m.acceptInvitationErrors[repo]; shouldFail && acceptErr != nil {
+			remaining = append(remaining, repo)
+			errs = append(errs, fmt.Errorf("accepting invitation for %s: %w", repo, acceptErr))
+			continue
+		}
+		m.collaboratorRepos[repo] = struct{}{}
+		accepted = append(accepted, repo)
+	}
+
+	m.pendingInvitations = remaining
+	return accepted, errors.Join(errs...)
+}
+
+// ListCollaboratorRepositories returns a deterministically sorted copy of active collaborator repositories.
+func (m *MockAccountClient) ListCollaboratorRepositories(ctx context.Context) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.listCollaboratorErr != nil {
+		return nil, m.listCollaboratorErr
+	}
+
+	repos := make([]string, 0, len(m.collaboratorRepos))
+	for repo := range m.collaboratorRepos {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+	return repos, nil
 }
