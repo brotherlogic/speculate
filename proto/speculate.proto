@@ -7,6 +7,18 @@ option go_package = "github.com/brotherlogic/speculate/proto";
 // SpeculateService manages repository enrollment and alignment tracking.
 service SpeculateService {
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
+}
+
+// LifecycleStage represents a tracked repository's current stage in the Speculate lifecycle.
+enum LifecycleStage {
+  LIFECYCLE_STAGE_UNSPECIFIED = 0;
+  LIFECYCLE_STAGE_AWAITING_SEED = 1;
+  LIFECYCLE_STAGE_EVALUATING = 2;
+  LIFECYCLE_STAGE_AWAITING_TEST_REVIEW = 3;
+  LIFECYCLE_STAGE_ALIGNING = 4;
+  LIFECYCLE_STAGE_STALLED = 5;
+  LIFECYCLE_STAGE_ALIGNED = 6;
 }
 
 // EnrollRequest initiates enrollment of a target repository.
@@ -21,6 +33,16 @@ message EnrollResponse {
   int32 alignment_percentage = 2;
   string issue_url = 3;
   string status_message = 4;
+  LifecycleStage stage = 5;
+  string last_error = 6;
+}
+
+// ListEnrollmentsRequest requests all currently tracked repository enrollment records.
+message ListEnrollmentsRequest {}
+
+// ListEnrollmentsResponse returns all currently tracked repository enrollment records.
+message ListEnrollmentsResponse {
+  repeated EnrollmentRecord records = 1;
 }
 
 // EnrollmentRecord represents the persisted state of an enrolled repository.
@@ -31,4 +53,6 @@ message EnrollmentRecord {
   int64 enrolled_at_unix = 4;
   int64 last_evaluated_at_unix = 5;
   string status_message = 6;
+  LifecycleStage stage = 7;
+  string last_error = 8;
 }
