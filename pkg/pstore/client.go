@@ -2,7 +2,9 @@ package pstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	pstorepb "github.com/brotherlogic/pstore/proto"
@@ -121,4 +123,54 @@ func (c *Client) GetEnrollment(ctx context.Context, repo string) (*pb.Enrollment
 	}
 
 	return record, nil
+}
+
+// ListEnrollments retrieves all persisted EnrollmentRecords sorted deterministically by repository name.
+func (c *Client) ListEnrollments(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+	resp, err := c.pstoreClient.GetKeys(ctx, &pstorepb.GetKeysRequest{
+		Prefix: "speculate/enrollment/",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list enrollment keys: %w", err)
+	}
+
+	keys := resp.GetKeys()
+	records := make([]*pb.EnrollmentRecord, 0, len(keys))
+	for _, key := range keys {
+		rec, err := c.GetEnrollment(ctx, key)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to get enrollment record for key %s: %w", key, err)
+		}
+		records = append(records, rec)
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].GetRepository() < records[j].GetRepository()
+	})
+
+	return records, nil
+}
+
+// DeleteEnrollment removes the persisted EnrollmentRecord for repo from pstore.
+func (c *Client) DeleteEnrollment(ctx context.Context, repo string) error {
+	if strings.TrimSpace(repo) == "" || NormalizeRepo(repo) == "" {
+		return fmt.Errorf("repository cannot be empty")
+	}
+
+	key := EnrollmentKey(repo)
+	if _, err := c.pstoreClient.Delete(ctx, &pstorepb.DeleteRequest{Key: key}); err != nil {
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "not found") ||
+			strings.Contains(strings.ToLower(err.Error()), "unable to locate") {
+			return nil
+		}
+		return fmt.Errorf("failed to delete enrollment record for %s: %w", repo, err)
+	}
+
+	return nil
 }

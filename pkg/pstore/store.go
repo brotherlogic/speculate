@@ -18,6 +18,8 @@ var (
 type Store interface {
 	SaveEnrollment(ctx context.Context, record *pb.EnrollmentRecord) error
 	GetEnrollment(ctx context.Context, repo string) (*pb.EnrollmentRecord, error)
+	ListEnrollments(ctx context.Context) ([]*pb.EnrollmentRecord, error)
+	DeleteEnrollment(ctx context.Context, repo string) error
 }
 
 // NormalizeRepo strips leading/trailing slashes and common prefixes.
