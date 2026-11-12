@@ -16,7 +16,7 @@ flowchart TD
     B --> C["2. Provision Workflows & CODEOWNERS<br/>(review-gate, auto-merge, tests, create-pr)"]
     C --> D{"User has Admin Access?"}
     D -- Yes --> E["3. Configure GitHub Repo Settings<br/>(auto-merge, branch deletion)"]
-    E --> F["4. Configure Collaborator<br/>(invite @brotherlogic-automation)"]
+    E --> F["4. Configure Collaborator<br/>(invite @brotherlogic-speculate)"]
     F --> G["5. Git Commit & Push<br/>(chore: initialize speculate project scaffolding)"]
     D -- No --> H["Log notice: admin permissions needed for repo settings/rulesets"]
     H --> G
@@ -105,7 +105,7 @@ speculate init [flags]
 | `--repo` | `TARGET_REPO` | Auto-detected | Target GitHub repository (`owner/name`). Inferred from `git remote get-url origin` if empty. |
 | `--dir` | `PROBER_TARGET_DIR` | `.` | Root directory of the target project to initialize. |
 | `--token` | `GH_TOKEN`, `GITHUB_TOKEN` | Inferred from `gh` | GitHub Personal Access Token used for API configuration and rulesets. |
-| `--collaborator` | - | `brotherlogic-automation` | Automation collaborator to invite with push permissions. |
+| `--collaborator` | - | `brotherlogic-speculate` | Collaborator account to invite with push permissions for automatic tracking. |
 | `--force` | - | `false` | Overwrite existing template files without prompting. |
 | `--skip-push` | - | `false` | Scaffold files and configure GitHub without creating a Git commit or pushing to remote. |
 
@@ -147,8 +147,8 @@ Configures repository behavior via the GitHub API:
 - Enables GitHub **Auto-merge** (`--enable-auto-merge`).
 - Enables **Automatic branch deletion** upon merge (`--delete-branch-on-merge`).
 
-#### 4. Automation Collaborator Access (Admin)
-Invites `@brotherlogic-automation` (or custom collaborator specified via `--collaborator`) with `push` permission, allowing automated agents to push branches and open PRs.
+#### 4. Collaborator Access & Automatic Tracking (Admin)
+Invites `@brotherlogic-speculate` (or a custom collaborator specified via `--collaborator`) with `push` permission, allowing the Speculate daemon to automatically accept the invitation, track the repository's lifecycle stage, and coordinate automated workflows.
 
 #### 5. Git Commit & Push
 - Stages `.github`, `specs`, `proto`, `tests`, and `internal`.
@@ -215,3 +215,37 @@ Once initialized, your repository is ready for autonomous spec-driven developmen
    docker run --rm ghcr.io/brotherlogic/speculate:latest \
      ./prober --mode=evaluator --target-repo=https://github.com/<owner>/<repo>
    ```
+
+---
+
+## Speculate Daemon, Collaborator Tracking & Web UI
+
+Running `speculate daemon` (the default command when invoked with no subcommand) starts both the gRPC `SpeculateService` server and the HTTP observability and dashboard server.
+
+### Automatic Collaborator Tracking (`brotherlogic-speculate`)
+
+When `GH_TOKEN` or `GITHUB_TOKEN` is configured for the `brotherlogic-speculate` account, the daemon runs a background collaborator `Syncer` on startup and on every `--sync-interval` (`SYNC_INTERVAL`, default `5m`):
+
+1. Automatically accepts pending GitHub collaboration invitations sent by `speculate init`.
+2. Discovers all active collaborator repositories and prunes repositories where collaborator access was removed.
+3. Evaluates each tracked repository across the six Speculate lifecycle stages (`Awaiting Seed`, `Evaluating`, `Awaiting Test Review`, `Aligning`, `Stalled`, and `Aligned`), preserving the last known stage alongside `last_error` if a transient check error occurs.
+4. Persists enrollment records to `pstore` (`PSTORE_ADDR`) wrapped with an in-memory `FallbackStore` so tracking and UI reads remain available during `pstore` outages.
+
+### Daemon Options
+
+| Flag | Env Var | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--http-port` | `PORT`, `HTTP_PORT` | `8080` | HTTP server port (serves `GET /`, `/healthz`, `/status`, `/metrics`). |
+| `--grpc-port` | `GRPC_PORT` | `50051` | gRPC `SpeculateService` port (`Enroll`, `ListEnrollments`). |
+| `--ollama-endpoint` | `OLLAMA_ENDPOINT` | `http://192.168.68.112:11434/v1` | Ollama LLM API endpoint. |
+| `--target-repo` | `TARGET_REPO` | `brotherlogic/speculate-kv` | Default target repository reported in `/status`. |
+| `--sync-interval` | `SYNC_INTERVAL` | `5m` | Interval between automatic collaborator discovery and evaluation cycles. |
+
+### Read-Only Web UI Dashboard (`GET /`) & On-Demand `speculate enroll`
+
+- **Web Dashboard (`GET /`)**: Visit `http://localhost:8080/` to view a read-only HTML dashboard listing all tracked repositories, their current lifecycle stage pill, alignment progress bar, active GitHub issue/PR link, last checked timestamp (UTC and relative), and any inline check error callout.
+- **On-Demand Check (`speculate enroll`)**: Trigger an immediate evaluation of a repository via gRPC without waiting for the next background sync tick:
+  ```bash
+  speculate enroll --daemon-addr=localhost:50051 <owner/repo>
+  ```
+

@@ -104,11 +104,17 @@ func runEnroll(ctx context.Context, args []string, stdout, stderr io.Writer, dia
 		activeIssue = "None"
 	}
 
+	stageLabel, _ := stagePresentation(resp.GetStage())
+
 	fmt.Fprintln(stdout, "Enrollment Status:")
 	fmt.Fprintf(stdout, "  Repository:   %s\n", resp.GetRepository())
+	fmt.Fprintf(stdout, "  Stage:        %s\n", stageLabel)
 	fmt.Fprintf(stdout, "  Alignment:    %d%%\n", resp.GetAlignmentPercentage())
 	fmt.Fprintf(stdout, "  Active Issue: %s\n", activeIssue)
 	fmt.Fprintf(stdout, "  Status:       %s\n", resp.GetStatusMessage())
+	if strings.TrimSpace(resp.GetLastError()) != "" {
+		fmt.Fprintf(stdout, "  Last Error:   %s\n", resp.GetLastError())
+	}
 
 	return nil
 }

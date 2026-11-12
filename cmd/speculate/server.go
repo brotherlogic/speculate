@@ -10,9 +10,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// EnrollmentPipeline specifies the interface required to enroll repositories into Speculate.
+// EnrollmentPipeline specifies the interface required to enroll and list repositories in Speculate.
 type EnrollmentPipeline interface {
 	Enroll(ctx context.Context, repo string) (*pb.EnrollResponse, error)
+	ListEnrollments(ctx context.Context) ([]*pb.EnrollmentRecord, error)
 }
 
 // SpeculateServer implements pb.SpeculateServiceServer with singleflight deduplication.
@@ -27,6 +28,25 @@ func NewSpeculateServer(pipeline EnrollmentPipeline) *SpeculateServer {
 	return &SpeculateServer{
 		pipeline: pipeline,
 	}
+}
+
+// ListEnrollments returns all currently tracked repository enrollment records.
+func (s *SpeculateServer) ListEnrollments(ctx context.Context, req *pb.ListEnrollmentsRequest) (*pb.ListEnrollmentsResponse, error) {
+	if s == nil || s.pipeline == nil {
+		return nil, status.Error(codes.Internal, "enrollment pipeline is not configured")
+	}
+
+	records, err := s.pipeline.ListEnrollments(ctx)
+	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		return nil, status.Errorf(codes.Internal, "failed to list enrollments: %v", err)
+	}
+
+	return &pb.ListEnrollmentsResponse{
+		Records: records,
+	}, nil
 }
 
 // Enroll orchestrates the enrollment of a target repository, deduplicating concurrent calls
