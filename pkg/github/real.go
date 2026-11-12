@@ -2,15 +2,22 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/go-github/v50/github"
 	"golang.org/x/oauth2"
+)
+
+var (
+	_ Client        = (*RealClient)(nil)
+	_ AccountClient = (*RealClient)(nil)
 )
 
 // ClientOption allows customizing RealClient.
@@ -72,6 +79,94 @@ func NewRealClient(token, owner, repo string, opts ...ClientOption) *RealClient 
 	}
 
 	return c
+}
+
+// NewRealAccountClient constructs an account-level GitHub Client adapter for the authenticated user.
+func NewRealAccountClient(token string, opts ...ClientOption) *RealClient {
+	return NewRealClient(token, "", "", opts...)
+}
+
+// AcceptPendingInvitations lists all pending repository invitations for the authenticated user
+// and accepts each one. Individual invitation acceptance failures are collected without aborting
+// remaining invitations.
+func (c *RealClient) AcceptPendingInvitations(ctx context.Context) ([]string, error) {
+	accepted := make([]string, 0)
+	var errs []error
+
+	for page := 1; ; {
+		invitations, resp, err := c.ghClient.Users.ListInvitations(ctx, &github.ListOptions{
+			PerPage: 100,
+			Page:    page,
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("listing repository invitations (page %d): %w", page, err))
+			return accepted, errors.Join(errs...)
+		}
+
+		for _, inv := range invitations {
+			if inv == nil {
+				continue
+			}
+			var repoFullName string
+			if repo := inv.GetRepo(); repo != nil {
+				repoFullName = strings.TrimSpace(repo.GetFullName())
+			}
+			if _, acceptErr := c.ghClient.Users.AcceptInvitation(ctx, inv.GetID()); acceptErr != nil {
+				errs = append(errs, fmt.Errorf("accepting invitation %d (%s): %w", inv.GetID(), repoFullName, acceptErr))
+				continue
+			}
+			if repoFullName != "" {
+				accepted = append(accepted, repoFullName)
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	return accepted, errors.Join(errs...)
+}
+
+// ListCollaboratorRepositories returns a deterministically sorted slice of unique "owner/repo"
+// full names for all repositories where the authenticated user is an active collaborator.
+func (c *RealClient) ListCollaboratorRepositories(ctx context.Context) ([]string, error) {
+	seen := make(map[string]struct{})
+
+	for page := 1; ; {
+		repos, resp, err := c.ghClient.Repositories.List(ctx, "", &github.RepositoryListOptions{
+			Affiliation: "collaborator",
+			ListOptions: github.ListOptions{
+				PerPage: 100,
+				Page:    page,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("listing collaborator repositories (page %d): %w", page, err)
+		}
+
+		for _, repo := range repos {
+			if repo == nil {
+				continue
+			}
+			if fullName := strings.TrimSpace(repo.GetFullName()); fullName != "" {
+				seen[fullName] = struct{}{}
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	result := make([]string, 0, len(seen))
+	for fullName := range seen {
+		result = append(result, fullName)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func (c *RealClient) Owner() string { return c.owner }

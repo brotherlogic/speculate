@@ -136,6 +136,12 @@ type Client interface {
 	UpdateReadmeBadge(ctx context.Context, branch, badgeMarkdown string) error
 }
 
+// AccountClient defines account-level operations for the authenticated GitHub user.
+type AccountClient interface {
+	AcceptPendingInvitations(ctx context.Context) ([]string, error)
+	ListCollaboratorRepositories(ctx context.Context) ([]string, error)
+}
+
 // ParseRepo extracts owner and repo name from GitHub URL or "owner/repo" string.
 func ParseRepo(raw string) (string, string, error) {
 	s := strings.TrimSpace(raw)

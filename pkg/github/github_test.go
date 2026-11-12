@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -774,3 +775,357 @@ func TestRealClient_AddIssueComment(t *testing.T) {
 	}
 }
 
+var (
+	_ AccountClient = (*RealClient)(nil)
+	_ AccountClient = (*MockAccountClient)(nil)
+)
+
+func TestRealAccountClient_AcceptPendingInvitations_PaginationAndPartialFailure(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Multi-page pagination accepts all invitations", func(t *testing.T) {
+		mux := http.NewServeMux()
+		var listPages []string
+		var acceptedIDs []string
+
+		mux.HandleFunc("/user/repository_invitations", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if gotPerPage := r.URL.Query().Get("per_page"); gotPerPage != "100" {
+				t.Errorf("expected per_page=100, got %q", gotPerPage)
+			}
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			listPages = append(listPages, page)
+
+			switch page {
+			case "1":
+				w.Header().Set("Link", `<http://`+r.Host+`/user/repository_invitations?page=2&per_page=100>; rel="next"`)
+				_ = json.NewEncoder(w).Encode([]*gh.RepositoryInvitation{
+					{
+						ID:   gh.Int64(101),
+						Repo: &gh.Repository{FullName: gh.String("brotherlogic/repo-one")},
+					},
+					{
+						ID:   gh.Int64(102),
+						Repo: &gh.Repository{FullName: gh.String("brotherlogic/repo-two")},
+					},
+				})
+			case "2":
+				_ = json.NewEncoder(w).Encode([]*gh.RepositoryInvitation{
+					{
+						ID:   gh.Int64(103),
+						Repo: &gh.Repository{FullName: gh.String("acme/repo-three")},
+					},
+				})
+			default:
+				http.Error(w, "unexpected page", http.StatusBadRequest)
+			}
+		})
+
+		mux.HandleFunc("/user/repository_invitations/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPatch {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			id := strings.TrimPrefix(r.URL.Path, "/user/repository_invitations/")
+			acceptedIDs = append(acceptedIDs, id)
+			w.WriteHeader(http.StatusNoContent)
+		})
+
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		client := NewRealAccountClient("fake-token", WithBaseURL(server.URL))
+		accepted, err := client.AcceptPendingInvitations(ctx)
+		if err != nil {
+			t.Fatalf("AcceptPendingInvitations failed: %v", err)
+		}
+
+		wantPages := []string{"1", "2"}
+		if strings.Join(listPages, ",") != strings.Join(wantPages, ",") {
+			t.Errorf("expected pages %v, got %v", wantPages, listPages)
+		}
+		wantIDs := []string{"101", "102", "103"}
+		if strings.Join(acceptedIDs, ",") != strings.Join(wantIDs, ",") {
+			t.Errorf("expected accepted IDs %v, got %v", wantIDs, acceptedIDs)
+		}
+		wantAccepted := []string{"brotherlogic/repo-one", "brotherlogic/repo-two", "acme/repo-three"}
+		if strings.Join(accepted, ",") != strings.Join(wantAccepted, ",") {
+			t.Errorf("expected accepted repos %v, got %v", wantAccepted, accepted)
+		}
+	})
+
+	t.Run("Partial failure resilience continues accepting remaining invitations", func(t *testing.T) {
+		mux := http.NewServeMux()
+
+		mux.HandleFunc("/user/repository_invitations", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode([]*gh.RepositoryInvitation{
+				{
+					ID:   gh.Int64(201),
+					Repo: &gh.Repository{FullName: gh.String("brotherlogic/failing-repo")},
+				},
+				{
+					ID:   gh.Int64(202),
+					Repo: &gh.Repository{FullName: gh.String("brotherlogic/succeeding-repo")},
+				},
+			})
+		})
+
+		mux.HandleFunc("/user/repository_invitations/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPatch {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			id := strings.TrimPrefix(r.URL.Path, "/user/repository_invitations/")
+			if id == "201" {
+				http.Error(w, `{"message":"Internal Server Error"}`, http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})
+
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		client := NewRealAccountClient("fake-token", WithBaseURL(server.URL))
+		accepted, err := client.AcceptPendingInvitations(ctx)
+		if err == nil {
+			t.Fatalf("expected non-nil error on partial failure, got nil")
+		}
+		wantAccepted := []string{"brotherlogic/succeeding-repo"}
+		if strings.Join(accepted, ",") != strings.Join(wantAccepted, ",") {
+			t.Errorf("expected accepted repos %v alongside partial error, got %v", wantAccepted, accepted)
+		}
+	})
+
+	t.Run("ListInvitations failure on later page returns accepted slice collected so far", func(t *testing.T) {
+		mux := http.NewServeMux()
+
+		mux.HandleFunc("/user/repository_invitations", func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			if page == "" || page == "1" {
+				w.Header().Set("Link", `<http://`+r.Host+`/user/repository_invitations?page=2&per_page=100>; rel="next"`)
+				_ = json.NewEncoder(w).Encode([]*gh.RepositoryInvitation{
+					{
+						ID:   gh.Int64(301),
+						Repo: &gh.Repository{FullName: gh.String("brotherlogic/page-one-repo")},
+					},
+				})
+				return
+			}
+			http.Error(w, `{"message":"Bad Gateway"}`, http.StatusBadGateway)
+		})
+
+		mux.HandleFunc("/user/repository_invitations/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})
+
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		client := NewRealAccountClient("fake-token", WithBaseURL(server.URL))
+		accepted, err := client.AcceptPendingInvitations(ctx)
+		if err == nil {
+			t.Fatalf("expected error when page 2 ListInvitations fails, got nil")
+		}
+		wantAccepted := []string{"brotherlogic/page-one-repo"}
+		if strings.Join(accepted, ",") != strings.Join(wantAccepted, ",") {
+			t.Errorf("expected accepted repos %v collected before error, got %v", wantAccepted, accepted)
+		}
+	})
+}
+
+func TestRealAccountClient_ListCollaboratorRepositories_PaginationAndSorting(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Affiliation query parameter, multi-page pagination, deduplication, and deterministic sorting", func(t *testing.T) {
+		mux := http.NewServeMux()
+		var requestedPages []string
+
+		mux.HandleFunc("/user/repos", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if gotAff := r.URL.Query().Get("affiliation"); gotAff != "collaborator" {
+				t.Errorf("expected affiliation=collaborator, got %q", gotAff)
+			}
+			if gotPerPage := r.URL.Query().Get("per_page"); gotPerPage != "100" {
+				t.Errorf("expected per_page=100, got %q", gotPerPage)
+			}
+			page := r.URL.Query().Get("page")
+			if page == "" {
+				page = "1"
+			}
+			requestedPages = append(requestedPages, page)
+
+			switch page {
+			case "1":
+				w.Header().Set("Link", `<http://`+r.Host+`/user/repos?affiliation=collaborator&page=2&per_page=100>; rel="next"`)
+				_ = json.NewEncoder(w).Encode([]*gh.Repository{
+					{FullName: gh.String("brotherlogic/zebra")},
+					{FullName: gh.String("brotherlogic/alpha")},
+					{FullName: gh.String("")},
+				})
+			case "2":
+				_ = json.NewEncoder(w).Encode([]*gh.Repository{
+					{FullName: gh.String("acme/beta")},
+					{FullName: gh.String("brotherlogic/alpha")}, // duplicate across pages
+					{},
+				})
+			default:
+				http.Error(w, "unexpected page", http.StatusBadRequest)
+			}
+		})
+
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		client := NewRealAccountClient("fake-token", WithBaseURL(server.URL))
+		repos, err := client.ListCollaboratorRepositories(ctx)
+		if err != nil {
+			t.Fatalf("ListCollaboratorRepositories failed: %v", err)
+		}
+
+		wantPages := []string{"1", "2"}
+		if strings.Join(requestedPages, ",") != strings.Join(wantPages, ",") {
+			t.Errorf("expected pages %v, got %v", wantPages, requestedPages)
+		}
+
+		wantRepos := []string{"acme/beta", "brotherlogic/alpha", "brotherlogic/zebra"}
+		if strings.Join(repos, ",") != strings.Join(wantRepos, ",") {
+			t.Errorf("expected sorted unique repos %v, got %v", wantRepos, repos)
+		}
+	})
+
+	t.Run("Propagates API error", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/user/repos", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"message":"Service Unavailable"}`, http.StatusServiceUnavailable)
+		})
+
+		server := httptest.NewServer(mux)
+		defer server.Close()
+
+		client := NewRealAccountClient("fake-token", WithBaseURL(server.URL))
+		_, err := client.ListCollaboratorRepositories(ctx)
+		if err == nil {
+			t.Fatalf("expected error on 503 response, got nil")
+		}
+	})
+}
+
+func TestMockAccountClient(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Invitation promotion and deterministic sorting", func(t *testing.T) {
+		mock := NewMockAccountClient()
+		mock.AddCollaboratorRepositories("brotherlogic/zeta")
+		mock.AddPendingInvitations("brotherlogic/beta", "acme/alpha")
+
+		// Before accepting invitations, only existing collaborator repo is listed.
+		repos, err := mock.ListCollaboratorRepositories(ctx)
+		if err != nil {
+			t.Fatalf("ListCollaboratorRepositories failed: %v", err)
+		}
+		if strings.Join(repos, ",") != "brotherlogic/zeta" {
+			t.Fatalf("expected [brotherlogic/zeta], got %v", repos)
+		}
+
+		// Accept pending invitations -> promotes them to active collaborator repos.
+		accepted, err := mock.AcceptPendingInvitations(ctx)
+		if err != nil {
+			t.Fatalf("AcceptPendingInvitations failed: %v", err)
+		}
+		wantAccepted := []string{"brotherlogic/beta", "acme/alpha"}
+		if strings.Join(accepted, ",") != strings.Join(wantAccepted, ",") {
+			t.Errorf("expected accepted %v, got %v", wantAccepted, accepted)
+		}
+
+		// Subsequent AcceptPendingInvitations has nothing left to accept.
+		acceptedAgain, err := mock.AcceptPendingInvitations(ctx)
+		if err != nil {
+			t.Fatalf("second AcceptPendingInvitations failed: %v", err)
+		}
+		if len(acceptedAgain) != 0 {
+			t.Errorf("expected 0 pending invitations remaining, got %v", acceptedAgain)
+		}
+
+		// ListCollaboratorRepositories returns a sorted defensive copy.
+		repos, err = mock.ListCollaboratorRepositories(ctx)
+		if err != nil {
+			t.Fatalf("ListCollaboratorRepositories failed: %v", err)
+		}
+		wantRepos := []string{"acme/alpha", "brotherlogic/beta", "brotherlogic/zeta"}
+		if strings.Join(repos, ",") != strings.Join(wantRepos, ",") {
+			t.Errorf("expected sorted repos %v, got %v", wantRepos, repos)
+		}
+
+		// Mutating returned slice does not mutate internal state.
+		repos[0] = "mutated/repo"
+		reposCheck, err := mock.ListCollaboratorRepositories(ctx)
+		if err != nil {
+			t.Fatalf("ListCollaboratorRepositories check failed: %v", err)
+		}
+		if reposCheck[0] != "acme/alpha" {
+			t.Errorf("expected defensive copy, got %v", reposCheck)
+		}
+	})
+
+	t.Run("Error injection for list invitations, per-repo accept, and list collaborator repos", func(t *testing.T) {
+		mock := NewMockAccountClient()
+		mock.AddPendingInvitations("brotherlogic/fail-repo", "brotherlogic/ok-repo")
+
+		// 1. List invitations error
+		listInvErr := errors.New("rate limit exceeded")
+		mock.SetListInvitationsError(listInvErr)
+		if _, err := mock.AcceptPendingInvitations(ctx); !errors.Is(err, listInvErr) {
+			t.Fatalf("expected error %v when listInvitationsErr is set, got %v", listInvErr, err)
+		}
+		mock.SetListInvitationsError(nil)
+
+		// 2. Per-repo accept error: failing repo stays pending, ok-repo is promoted
+		acceptErr := errors.New("accept invitation failed")
+		mock.SetAcceptInvitationError("brotherlogic/fail-repo", acceptErr)
+		accepted, err := mock.AcceptPendingInvitations(ctx)
+		if !errors.Is(err, acceptErr) {
+			t.Fatalf("expected wrapped partial error %v when per-repo accept error is configured, got %v", acceptErr, err)
+		}
+		if strings.Join(accepted, ",") != "brotherlogic/ok-repo" {
+			t.Errorf("expected [brotherlogic/ok-repo] accepted, got %v", accepted)
+		}
+		if strings.Join(mock.PendingInvitations(), ",") != "brotherlogic/fail-repo" {
+			t.Errorf("expected [brotherlogic/fail-repo] to remain pending, got %v", mock.PendingInvitations())
+		}
+
+		repos, err := mock.ListCollaboratorRepositories(ctx)
+		if err != nil {
+			t.Fatalf("ListCollaboratorRepositories failed: %v", err)
+		}
+		if strings.Join(repos, ",") != "brotherlogic/ok-repo" {
+			t.Errorf("expected only [brotherlogic/ok-repo] in collaborator repos, got %v", repos)
+		}
+
+		// Clearing per-repo accept error allows failing repo to be accepted on retry
+		mock.SetAcceptInvitationError("brotherlogic/fail-repo", nil)
+		acceptedRetry, err := mock.AcceptPendingInvitations(ctx)
+		if err != nil {
+			t.Fatalf("expected retry AcceptPendingInvitations to succeed, got %v", err)
+		}
+		if strings.Join(acceptedRetry, ",") != "brotherlogic/fail-repo" {
+			t.Errorf("expected [brotherlogic/fail-repo] accepted on retry, got %v", acceptedRetry)
+		}
+
+		// 3. List collaborator repos error
+		listCollabErr := errors.New("collaborator list unavailable")
+		mock.SetListCollaboratorRepositoriesError(listCollabErr)
+		if _, err := mock.ListCollaboratorRepositories(ctx); !errors.Is(err, listCollabErr) {
+			t.Fatalf("expected error %v when listCollaboratorErr is set, got %v", listCollabErr, err)
+		}
+	})
+}
