@@ -3,6 +3,7 @@ package pstore
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -56,4 +57,34 @@ func (m *MockStore) GetEnrollment(ctx context.Context, repo string) (*pb.Enrollm
 	}
 
 	return proto.Clone(rec).(*pb.EnrollmentRecord), nil
+}
+
+// ListEnrollments returns deep copies of all stored EnrollmentRecords sorted ascending by repository.
+func (m *MockStore) ListEnrollments(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	records := make([]*pb.EnrollmentRecord, 0, len(m.records))
+	for _, rec := range m.records {
+		records = append(records, proto.Clone(rec).(*pb.EnrollmentRecord))
+	}
+
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].GetRepository() < records[j].GetRepository()
+	})
+
+	return records, nil
+}
+
+// DeleteEnrollment removes the EnrollmentRecord for repo from memory, idempotently returning nil if absent.
+func (m *MockStore) DeleteEnrollment(ctx context.Context, repo string) error {
+	if strings.TrimSpace(repo) == "" || NormalizeRepo(repo) == "" {
+		return fmt.Errorf("repository cannot be empty")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.records, NormalizeRepo(repo))
+	return nil
 }
