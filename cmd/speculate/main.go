@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -173,26 +174,36 @@ func runDaemon(args []string) {
 	log.Println("Speculate daemon stopped.")
 }
 
-func runInit(args []string) {
-	fs := flag.NewFlagSet("init", flag.ExitOnError)
+func parseInitConfig(args []string) (*setup.Config, error) {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	repo := fs.String("repo", "", "Target GitHub repository (owner/name); inferred from git remote if empty")
 	token := fs.String("token", "", "GitHub personal access token (defaults to GH_TOKEN / GITHUB_TOKEN)")
-	collaborator := fs.String("collaborator", "brotherlogic-automation", "Automation collaborator to add")
+	collaborator := fs.String("collaborator", setup.DefaultCollaborator, "Automation collaborator to add")
 	dir := fs.String("dir", ".", "Target project directory")
 	force := fs.Bool("force", false, "Overwrite existing files without prompting")
 	skipPush := fs.Bool("skip-push", false, "Skip git commit and push")
 
 	if err := fs.Parse(args); err != nil {
-		log.Fatalf("failed parsing flags: %v", err)
+		return nil, err
 	}
 
-	cfg := &setup.Config{
+	return &setup.Config{
 		RootDir:      *dir,
 		Repo:         *repo,
 		Token:        *token,
 		Collaborator: *collaborator,
 		Force:        *force,
 		SkipPush:     *skipPush,
+	}, nil
+}
+
+func runInit(args []string) {
+	cfg, err := parseInitConfig(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		log.Fatalf("failed parsing flags: %v", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

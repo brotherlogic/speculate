@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/brotherlogic/speculate/pkg/setup"
 	pb "github.com/brotherlogic/speculate/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -294,3 +295,70 @@ func TestRunEnroll_GRPCStatusErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestParseInitConfig_CollaboratorFlag(t *testing.T) {
+	t.Run("defaults collaborator to brotherlogic-speculate", func(t *testing.T) {
+		cfg, err := parseInitConfig([]string{})
+		if err != nil {
+			t.Fatalf("parseInitConfig returned unexpected error: %v", err)
+		}
+		if cfg.Collaborator != setup.DefaultCollaborator {
+			t.Errorf("cfg.Collaborator = %q, want DefaultCollaborator %q", cfg.Collaborator, setup.DefaultCollaborator)
+		}
+		if cfg.Collaborator != "brotherlogic-speculate" {
+			t.Errorf("cfg.Collaborator = %q, want %q", cfg.Collaborator, "brotherlogic-speculate")
+		}
+	})
+
+	t.Run("respects custom collaborator flag", func(t *testing.T) {
+		cfg, err := parseInitConfig([]string{"--collaborator=my-bot"})
+		if err != nil {
+			t.Fatalf("parseInitConfig returned unexpected error: %v", err)
+		}
+		if cfg.Collaborator != "my-bot" {
+			t.Errorf("cfg.Collaborator = %q, want %q", cfg.Collaborator, "my-bot")
+		}
+	})
+
+	t.Run("preserves empty collaborator flag to skip ConfigureCollaborator", func(t *testing.T) {
+		cfg, err := parseInitConfig([]string{"--collaborator="})
+		if err != nil {
+			t.Fatalf("parseInitConfig returned unexpected error: %v", err)
+		}
+		if cfg.Collaborator != "" {
+			t.Errorf("cfg.Collaborator = %q, want empty string", cfg.Collaborator)
+		}
+	})
+
+	t.Run("parses other init flags alongside collaborator", func(t *testing.T) {
+		cfg, err := parseInitConfig([]string{
+			"--repo=owner/repo",
+			"--token=ghp_test123",
+			"--dir=/tmp/project",
+			"--force",
+			"--skip-push",
+		})
+		if err != nil {
+			t.Fatalf("parseInitConfig returned unexpected error: %v", err)
+		}
+		if cfg.Repo != "owner/repo" {
+			t.Errorf("cfg.Repo = %q, want %q", cfg.Repo, "owner/repo")
+		}
+		if cfg.Token != "ghp_test123" {
+			t.Errorf("cfg.Token = %q, want %q", cfg.Token, "ghp_test123")
+		}
+		if cfg.RootDir != "/tmp/project" {
+			t.Errorf("cfg.RootDir = %q, want %q", cfg.RootDir, "/tmp/project")
+		}
+		if !cfg.Force {
+			t.Errorf("cfg.Force = false, want true")
+		}
+		if !cfg.SkipPush {
+			t.Errorf("cfg.SkipPush = false, want true")
+		}
+		if cfg.Collaborator != "brotherlogic-speculate" {
+			t.Errorf("cfg.Collaborator = %q, want %q", cfg.Collaborator, "brotherlogic-speculate")
+		}
+	})
+}
+

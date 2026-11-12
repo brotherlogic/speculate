@@ -231,9 +231,14 @@ func EnsurePassingTests(cfg *Config) error {
 
 // SetupTemplateFiles renders and writes the required GitHub workflows and CODEOWNERS.
 func SetupTemplateFiles(cfg *Config) ([]string, error) {
+	collaborator := strings.TrimSpace(cfg.Collaborator)
+	if collaborator == "" {
+		collaborator = DefaultCollaborator
+	}
 	tmplCtx := TemplateContext{
-		Owner: cfg.Owner,
-		Repo:  cfg.Repo,
+		Owner:        cfg.Owner,
+		Repo:         cfg.Repo,
+		Collaborator: collaborator,
 	}
 
 	reviewGateContent, err := renderTemplate(reviewGateTemplate, tmplCtx)

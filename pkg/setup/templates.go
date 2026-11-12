@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	SeedIssueTitle = "[Speculate] Add initial seed proto and spec files"
-	SeedIssueLabel = "speculate-seed"
+	DefaultCollaborator = "brotherlogic-speculate"
+	SeedIssueTitle      = "[Speculate] Add initial seed proto and spec files"
+	SeedIssueLabel      = "speculate-seed"
 )
 
 // RenderSeedIssueBody renders the Markdown body for the seed tracking issue.
@@ -36,8 +37,9 @@ Please add the missing seed files to `+"`proto/`"+` and `+"`specs/`"+`, then com
 }
 
 type TemplateContext struct {
-	Owner string
-	Repo  string
+	Owner        string
+	Repo         string
+	Collaborator string
 }
 
 const codeownersTemplate = `# CODEOWNERS for Speculate-managed repository
@@ -114,7 +116,7 @@ jobs:
           fi
 
           PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author --jq '.author.login')
-          if [ "$PR_AUTHOR" = "[[.Owner]]" ] || [ "$PR_AUTHOR" = "brotherlogic-automation" ]; then
+          if [ "$PR_AUTHOR" = "[[.Owner]]" ] || [ "$PR_AUTHOR" = "[[.Collaborator]]" ] || [ "$PR_AUTHOR" = "brotherlogic-automation" ]; then
             echo "✓ PR #${PR_NUMBER} is authored by @${PR_AUTHOR}. Human review requirement satisfied by author."
             exit 0
           fi
