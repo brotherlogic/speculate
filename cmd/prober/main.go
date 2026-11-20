@@ -140,6 +140,13 @@ func main() {
 		} else {
 			fmt.Println("✅ [PROBER PASS] Repository enrollment verified successfully!")
 		}
+	} else if *mode == "simulation" {
+		runErr = runSimulationProber(ctx, *targetRepo)
+		if runErr != nil {
+			log.Printf("❌ Prober Failed: %v", runErr)
+		} else {
+			fmt.Println("✅ [PROBER PASS] Phase 4 orchestrator simulation verified successfully!")
+		}
 	} else {
 		resolvedDir, cleanup, err := resolveTargetDir(ctx, *targetDir, *targetRepo, repoExplicit)
 		if err != nil {
