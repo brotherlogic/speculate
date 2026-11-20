@@ -3,10 +3,13 @@ package dcm
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	dcmproto "github.com/brotherlogic/devcontainer-manager/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // MockServer implements dcmproto.ManagerServiceServer in-memory for testing.
@@ -50,6 +53,10 @@ func (s *MockServer) Up(ctx context.Context, req *dcmproto.UpRequest) (*dcmproto
 func (s *MockServer) Down(ctx context.Context, req *dcmproto.DownRequest) (*dcmproto.DownResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if _, ok := s.containers[req.GetId()]; !ok {
+		return nil, status.Errorf(codes.NotFound, "container %s not found", req.GetId())
+	}
 
 	delete(s.containers, req.GetId())
 	return &dcmproto.DownResponse{}, nil
@@ -106,6 +113,7 @@ type MockClient struct {
 	containers map[string]*DevcontainerConfig
 	prompts    map[string][]string
 	nextID     int
+	DownCalls  []string
 }
 
 // NewMockClient constructs a MockClient.
@@ -143,6 +151,20 @@ func (m *MockClient) Up(ctx context.Context, params *UpParams) (*DevcontainerCon
 	return cfg, nil
 }
 
+// Down simulates tearing down an active devcontainer and records the call.
+func (m *MockClient) Down(ctx context.Context, containerID string) error {
+	if strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.DownCalls = append(m.DownCalls, containerID)
+	delete(m.containers, containerID)
+	return nil
+}
+
 // PushPrompt records a prompt sent to a container.
 func (m *MockClient) PushPrompt(ctx context.Context, containerID, prompt string) error {
 	m.mu.Lock()
@@ -174,6 +196,34 @@ func (m *MockClient) WaitForReady(ctx context.Context, containerID string, pollI
 	}
 
 	return cfg, nil
+}
+
+// WaitForGone polls until containerID is removed from MockClient or context cancels.
+func (m *MockClient) WaitForGone(ctx context.Context, containerID string, pollInterval time.Duration) error {
+	if strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+	if pollInterval <= 0 {
+		pollInterval = 1 * time.Second
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		m.mu.RLock()
+		_, exists := m.containers[containerID]
+		m.mu.RUnlock()
+		if !exists {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // List returns all active configs.

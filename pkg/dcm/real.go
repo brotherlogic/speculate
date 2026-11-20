@@ -3,11 +3,14 @@ package dcm
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	dcmproto "github.com/brotherlogic/devcontainer-manager/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // RealClient manages communication with a real devcontainer-manager gRPC service.
@@ -77,6 +80,24 @@ func (c *RealClient) Up(ctx context.Context, params *UpParams) (*DevcontainerCon
 	return resp.GetConfig(), nil
 }
 
+// Down tears down an active devcontainer on devcontainer-manager.
+// Empty containerID and gRPC NotFound responses are treated as idempotent success.
+func (c *RealClient) Down(ctx context.Context, containerID string) error {
+	if strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+
+	_, err := c.grpcClient.Down(ctx, &dcmproto.DownRequest{Id: containerID})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil
+		}
+		return fmt.Errorf("DCM Down RPC failed for %s: %w", containerID, err)
+	}
+
+	return nil
+}
+
 // PushPrompt pushes a prompt to an active devcontainer.
 func (c *RealClient) PushPrompt(ctx context.Context, containerID, prompt string) error {
 	req := &dcmproto.PushPromptRequest{
@@ -129,6 +150,41 @@ func (c *RealClient) WaitForReady(ctx context.Context, containerID string, pollI
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// WaitForGone polls List until containerID is no longer present or ctx is done.
+func (c *RealClient) WaitForGone(ctx context.Context, containerID string, pollInterval time.Duration) error {
+	if strings.TrimSpace(containerID) == "" {
+		return nil
+	}
+	if pollInterval <= 0 {
+		pollInterval = 1 * time.Second
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		configs, err := c.List(ctx)
+		if err == nil {
+			found := false
+			for _, cfg := range configs {
+				if cfg.GetId() == containerID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}

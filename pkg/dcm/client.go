@@ -2,6 +2,8 @@ package dcm
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	dcmproto "github.com/brotherlogic/devcontainer-manager/proto"
@@ -49,11 +51,17 @@ type Client interface {
 	// Up requests devcontainer-manager to spin up a container environment for a branch.
 	Up(ctx context.Context, params *UpParams) (*DevcontainerConfig, error)
 
+	// Down requests devcontainer-manager to tear down an active container environment.
+	Down(ctx context.Context, containerID string) error
+
 	// PushPrompt delivers a prompt instruction to an active devcontainer session.
 	PushPrompt(ctx context.Context, containerID, prompt string) error
 
 	// WaitForReady polls the container state until it reaches StateReady, fails, or context cancels.
 	WaitForReady(ctx context.Context, containerID string, pollInterval time.Duration) (*DevcontainerConfig, error)
+
+	// WaitForGone polls until the container is no longer present in List or context cancels.
+	WaitForGone(ctx context.Context, containerID string, pollInterval time.Duration) error
 
 	// List queries currently tracked devcontainers.
 	List(ctx context.Context) ([]*DevcontainerConfig, error)
@@ -63,4 +71,16 @@ type Client interface {
 
 	// Close releases the underlying gRPC connection.
 	Close() error
+}
+
+// ParseHarness normalizes a string harness identifier into a DCM Harness enum value.
+func ParseHarness(raw string) (Harness, error) {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "", "ANTIGRAVITY", "HARNESS_ANTIGRAVITY":
+		return HarnessAntigravity, nil
+	case "PI", "HARNESS_PI":
+		return HarnessPi, nil
+	default:
+		return HarnessUnspecified, fmt.Errorf("unknown DCM harness %q", raw)
+	}
 }
