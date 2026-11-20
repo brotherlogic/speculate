@@ -55,4 +55,12 @@ message EnrollmentRecord {
   string status_message = 6;
   LifecycleStage stage = 7;
   string last_error = 8;
+  string active_branch = 9;
+  int32 active_pr_number = 10;
+  int32 active_issue_number = 11;
+  string approved_test_sha = 12;
+  string last_evaluated_sha = 13;
+  int32 attempt_count = 14;
+  string active_container_id = 15;
+  int64 attempt_started_at_unix = 16;
 }

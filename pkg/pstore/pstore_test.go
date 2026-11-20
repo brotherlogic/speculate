@@ -154,12 +154,22 @@ func TestMockStore_SaveAndGetRoundTrip(t *testing.T) {
 	store := pstore.NewMockStore()
 
 	record := &pb.EnrollmentRecord{
-		Repository:          "brotherlogic/speculate",
-		AlignmentPercentage: 85,
-		IssueUrl:            "https://github.com/brotherlogic/speculate/issues/100",
-		EnrolledAtUnix:      1700000000,
-		LastEvaluatedAtUnix: 1700001000,
-		StatusMessage:       "Enrolled successfully",
+		Repository:           "brotherlogic/speculate",
+		AlignmentPercentage:  85,
+		IssueUrl:             "https://github.com/brotherlogic/speculate/issues/100",
+		EnrolledAtUnix:       1700000000,
+		LastEvaluatedAtUnix:  1700001000,
+		StatusMessage:        "Enrolled successfully",
+		Stage:                pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNING,
+		LastError:            "",
+		ActiveBranch:         "feat/put-get-delete",
+		ActivePrNumber:       12,
+		ActiveIssueNumber:    11,
+		ApprovedTestSha:      "abc1234deadbeef",
+		LastEvaluatedSha:     "def5678cafebabe",
+		AttemptCount:         1,
+		ActiveContainerId:    "dcm-mock-1",
+		AttemptStartedAtUnix: 1700000900,
 	}
 
 	if err := store.SaveEnrollment(ctx, record); err != nil {
@@ -173,6 +183,16 @@ func TestMockStore_SaveAndGetRoundTrip(t *testing.T) {
 
 	if !proto.Equal(got, record) {
 		t.Errorf("GetEnrollment returned %+v, want %+v", got, record)
+	}
+	if got.GetActiveBranch() != "feat/put-get-delete" ||
+		got.GetActivePrNumber() != 12 ||
+		got.GetActiveIssueNumber() != 11 ||
+		got.GetApprovedTestSha() != "abc1234deadbeef" ||
+		got.GetLastEvaluatedSha() != "def5678cafebabe" ||
+		got.GetAttemptCount() != 1 ||
+		got.GetActiveContainerId() != "dcm-mock-1" ||
+		got.GetAttemptStartedAtUnix() != 1700000900 {
+		t.Errorf("unexpected Phase 4 orchestration getters after MockStore round-trip: %+v", got)
 	}
 }
 
@@ -309,12 +329,22 @@ func TestClient_SaveAndGetRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	record := &pb.EnrollmentRecord{
-		Repository:          "brotherlogic/speculate-kv",
-		AlignmentPercentage: 92,
-		IssueUrl:            "https://github.com/brotherlogic/speculate-kv/issues/42",
-		EnrolledAtUnix:      1710000000,
-		LastEvaluatedAtUnix: 1710002000,
-		StatusMessage:       "Alignment verified",
+		Repository:           "brotherlogic/speculate-kv",
+		AlignmentPercentage:  92,
+		IssueUrl:             "https://github.com/brotherlogic/speculate-kv/issues/42",
+		EnrolledAtUnix:       1710000000,
+		LastEvaluatedAtUnix:  1710002000,
+		StatusMessage:        "Alignment verified",
+		Stage:                pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_TEST_REVIEW,
+		LastError:            "temporary warning",
+		ActiveBranch:         "feat/kv-store",
+		ActivePrNumber:       43,
+		ActiveIssueNumber:    41,
+		ApprovedTestSha:      "1111222233334444",
+		LastEvaluatedSha:     "5555666677778888",
+		AttemptCount:         3,
+		ActiveContainerId:    "dcm-client-99",
+		AttemptStartedAtUnix: 1710001900,
 	}
 
 	if err := client.SaveEnrollment(ctx, record); err != nil {
@@ -334,6 +364,16 @@ func TestClient_SaveAndGetRoundTrip(t *testing.T) {
 
 	if !proto.Equal(got, record) {
 		t.Errorf("GetEnrollment returned %+v, want %+v", got, record)
+	}
+	if got.GetActiveBranch() != "feat/kv-store" ||
+		got.GetActivePrNumber() != 43 ||
+		got.GetActiveIssueNumber() != 41 ||
+		got.GetApprovedTestSha() != "1111222233334444" ||
+		got.GetLastEvaluatedSha() != "5555666677778888" ||
+		got.GetAttemptCount() != 3 ||
+		got.GetActiveContainerId() != "dcm-client-99" ||
+		got.GetAttemptStartedAtUnix() != 1710001900 {
+		t.Errorf("unexpected Phase 4 orchestration getters after Client round-trip: %+v", got)
 	}
 }
 
