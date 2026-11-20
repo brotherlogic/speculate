@@ -103,7 +103,7 @@ jobs:
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             case "$file" in
-              *.proto|*_test.go|specs/*|*/specs/*|tests/*|*/tests/*|proto/*|*/proto/*|api/*|*/api/*)
+              *.proto|*_test.go|specs/*|*/specs/*|tests/*|*/tests/*|proto/*|*/proto/*|api/*|*/api/*|.github/*)
                 echo "Protected path matched: $file"
                 PROTECTED=true
                 ;;
@@ -116,7 +116,7 @@ jobs:
           fi
 
           PR_AUTHOR=$(gh pr view "$PR_NUMBER" --json author --jq '.author.login')
-          if [ "$PR_AUTHOR" = "[[.Owner]]" ] || [ "$PR_AUTHOR" = "[[.Collaborator]]" ] || [ "$PR_AUTHOR" = "brotherlogic-automation" ]; then
+          if [ "$PR_AUTHOR" = "[[.Owner]]" ]; then
             echo "✓ PR #${PR_NUMBER} is authored by @${PR_AUTHOR}. Human review requirement satisfied by author."
             exit 0
           fi
@@ -129,25 +129,38 @@ jobs:
           fi
 
           echo "Checking for approval from @[[.Owner]]..."
-          APPROVALS=$(gh pr view "$PR_NUMBER" --json reviews --jq '[.reviews[] | select(.author.login == "[[.Owner]]" and .state == "APPROVED")] | length')
-          echo "Found $APPROVALS approval(s) from @[[.Owner]]"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          APPROVED_SHA=$(gh api repos/[[.Owner]]/[[.Repo]]/pulls/$PR_NUMBER/reviews --jq '[.[] | select(.user.login == "[[.Owner]]" and .state == "APPROVED")] | last | .commit_id')
 
-          if [ "$APPROVALS" -gt 0 ]; then
-            echo "✓ PR #${PR_NUMBER} has been approved by @[[.Owner]]."
-            if [ "${{ github.event_name }}" = "pull_request_review" ]; then
-              HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-              echo "Review approved on pull_request_review event. Checking for previous failed pull_request runs on ${HEAD_SHA}..."
-              FAILED_RUNS=$(gh run list --workflow=review-gate.yml --event=pull_request --commit="$HEAD_SHA" --status=failure --json databaseId --jq '.[].databaseId')
-              for run_id in $FAILED_RUNS; do
-                echo "Triggering rerun of failed pull_request run $run_id..."
-                gh run rerun "$run_id" || true
-              done
-            fi
-            exit 0
-          else
+          if [ -z "$APPROVED_SHA" ] || [ "$APPROVED_SHA" = "null" ]; then
             echo "::error::PR #${PR_NUMBER} modifies protected contracts/specs/tests and requires an approving review from @[[.Owner]]."
             exit 1
           fi
+
+          echo "✓ PR #${PR_NUMBER} has been approved by @[[.Owner]] at commit ${APPROVED_SHA}."
+          if [ "$APPROVED_SHA" != "$HEAD_SHA" ]; then
+            echo "Inspecting files changed since approved commit ${APPROVED_SHA}..${HEAD_SHA}..."
+            POST_APPROVAL_FILES=$(git diff --name-only "$APPROVED_SHA..$HEAD_SHA")
+            while IFS= read -r file; do
+              [ -z "$file" ] && continue
+              case "$file" in
+                *.proto|*_test.go|specs/*|*/specs/*|tests/*|*/tests/*|proto/*|*/proto/*|api/*|*/api/*|.github/*)
+                  echo "::error::Protected file modified after @[[.Owner]] approval (${APPROVED_SHA}..${HEAD_SHA}): $file"
+                  exit 1
+                  ;;
+              esac
+            done <<< "$POST_APPROVAL_FILES"
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request_review" ]; then
+            echo "Review approved on pull_request_review event. Checking for previous failed pull_request runs on ${HEAD_SHA}..."
+            FAILED_RUNS=$(gh run list --workflow=review-gate.yml --event=pull_request --commit="$HEAD_SHA" --status=failure --json databaseId --jq '.[].databaseId')
+            for run_id in $FAILED_RUNS; do
+              echo "Triggering rerun of failed pull_request run $run_id..."
+              gh run rerun "$run_id" || true
+            done
+          fi
+          exit 0
 `
 
 const autoMergeTemplate = `name: Auto-merge PR
@@ -201,7 +214,32 @@ on:
       - main
 
 jobs:
+  compile:
+    name: compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run build
+        run: go build ./...
+
+      - name: Run lint
+        run: go vet ./...
+
+      - name: Compile tests
+        run: sh -c 'for pkg in $(go list ./tests/... 2>/dev/null); do go test -c -o /dev/null "$pkg"; done'
+
   test:
+    name: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -217,12 +255,6 @@ jobs:
 
       - name: Run tests
         run: go test -v ./...
-
-      - name: Run build
-        run: go build ./...
-
-      - name: Run lint
-        run: go vet ./...
 `
 
 const createPrTemplate = `name: Create PR
