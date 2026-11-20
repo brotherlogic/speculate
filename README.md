@@ -231,6 +231,15 @@ When `GH_TOKEN` or `GITHUB_TOKEN` is configured for the `brotherlogic-speculate`
 3. Evaluates each tracked repository across the six Speculate lifecycle stages (`Awaiting Seed`, `Evaluating`, `Awaiting Test Review`, `Aligning`, `Stalled`, and `Aligned`), preserving the last known stage alongside `last_error` if a transient check error occurs.
 4. Persists enrollment records to `pstore` (`PSTORE_ADDR`) wrapped with an in-memory `FallbackStore` so tracking and UI reads remain available during `pstore` outages.
 
+### Phase 4 Red-to-Green Orchestrator (`pkg/orchestrator`)
+
+The `pkg/orchestrator.Reconciler` (integrated with `pkg/enroll.Pipeline`) drives an idempotent, single-flight single-PR Red-to-Green lifecycle per scenario (`feat/<scenario-slug> -> main`):
+
+1. **Seed & Stalled Checks**: Verifies `proto/*.proto` and `specs/*.md` on `main` (auto-closing `speculate-seed` once present), honors `speculate-stalled` by tearing down active containers (`DCM.Down`), and resets strike counters to `0` when the stalled label is removed or the stalled issue is closed.
+2. **PR-Based Alignment Badges**: Writes updated alignment badges onto `feat/<scenario-slug>` and opens an idempotent `chore/readme-badge` PR when `100%` aligned with a stale badge on `main` (never committing directly to protected `main`).
+3. **Red Phase (`EVALUATING` -> `AWAITING_TEST_REVIEW`)**: Synthesizes a Scenario Card (`[Speculate Loop]`), provisions a `DCM.Up` container (`HARNESS_ANTIGRAVITY`) to author a compiling-but-RED test (`compile=success`, `test=failure`), tears down the container on verification, and retries up to 3 strikes (`Down` + `WaitForGone` + `Up`) on failures or 30m inactivity timeouts.
+4. **Green Phase (`AWAITING_TEST_REVIEW` -> `ALIGNING` -> `ALIGNED`)**: On `@<owner>` `APPROVED` review (`approved_test_sha`), closes `[Speculate Loop]`, opens `[Speculate Align]`, launches a fresh `DCM.Up` session to implement `internal/**`, resets the branch on any post-approval edits to protected paths, and squash-merges + cleans up the branch once `compile`, `test`, and `review-gate` all succeed.
+
 ### Daemon Options
 
 | Flag | Env Var | Default | Description |
