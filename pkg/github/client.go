@@ -3,8 +3,10 @@ package github
 import (
 	"context"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Standard labels used in the Speculate autonomous alignment loop.
@@ -85,10 +87,30 @@ type PullRequest struct {
 	Number  int    `json:"number"`
 	Title   string `json:"title"`
 	Head    string `json:"head"`
+	HeadSHA string `json:"head_sha"`
 	Base    string `json:"base"`
 	State   string `json:"state"`
 	Merged  bool   `json:"merged"`
 	HTMLURL string `json:"html_url"`
+}
+
+// PullRequestReview represents a review submitted on a GitHub Pull Request.
+type PullRequestReview struct {
+	ID          int64     `json:"id"`
+	Author      string    `json:"author"`
+	State       string    `json:"state"`
+	CommitID    string    `json:"commit_id"`
+	SubmittedAt time.Time `json:"submitted_at"`
+}
+
+// CheckRun represents a GitHub Actions check run for a commit ref.
+type CheckRun struct {
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	Status        string `json:"status"`
+	Conclusion    string `json:"conclusion"`
+	DetailsURL    string `json:"details_url"`
+	OutputSummary string `json:"output_summary"`
 }
 
 // MergeResult represents the outcome of a Pull Request merge operation.
@@ -113,6 +135,7 @@ type Client interface {
 	GetBranch(ctx context.Context, branch string) (*Branch, error)
 	CreateBranch(ctx context.Context, branch, baseBranchOrSHA string) (*Branch, error)
 	DeleteBranch(ctx context.Context, branch string) error
+	ResetBranch(ctx context.Context, branch, targetSHA string) error
 
 	// Label management
 	EnsureLabels(ctx context.Context, labels []Label) error
@@ -122,18 +145,48 @@ type Client interface {
 	GetIssue(ctx context.Context, number int) (*Issue, error)
 	CloseIssue(ctx context.Context, number int) error
 	AddIssueComment(ctx context.Context, number int, body string) error
+	AddIssueLabels(ctx context.Context, number int, labels []string) error
+	RemoveIssueLabel(ctx context.Context, number int, label string) error
 	ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error)
 	FindOpenIssueByLabel(ctx context.Context, label string) (*Issue, error)
 
-	// Pull Request management
+	// Pull Request, review, check run, and diff inspection
 	CreatePullRequest(ctx context.Context, req *CreatePRRequest) (*PullRequest, error)
 	GetPullRequest(ctx context.Context, number int) (*PullRequest, error)
+	FindOpenPullRequestByHead(ctx context.Context, headBranch string) (*PullRequest, error)
+	ListPullRequestReviews(ctx context.Context, prNumber int) ([]*PullRequestReview, error)
+	ListCheckRunsForRef(ctx context.Context, ref string) ([]*CheckRun, error)
+	ListChangedFiles(ctx context.Context, baseRef, headRef string) ([]string, error)
 	SquashMergePullRequest(ctx context.Context, prNumber int, commitTitle, commitMessage string) (*MergeResult, error)
 
 	// File and README badge operations
 	GetFileContent(ctx context.Context, path, ref string) (*FileContent, error)
 	UpdateFile(ctx context.Context, path, content, sha, branch, commitMessage string) error
 	UpdateReadmeBadge(ctx context.Context, branch, badgeMarkdown string) error
+}
+
+// IsProtectedPath reports whether relPath falls under protected spec, proto, test,
+// API, or workflow locations that must not be altered after test approval.
+func IsProtectedPath(relPath string) bool {
+	cleaned := strings.TrimSpace(relPath)
+	if cleaned == "" {
+		return false
+	}
+	cleaned = strings.ReplaceAll(cleaned, "\\", "/")
+	cleaned = strings.TrimLeft(cleaned, "/")
+	cleaned = path.Clean(cleaned)
+	if cleaned == "" || cleaned == "." {
+		return false
+	}
+
+	protectedPrefixes := []string{"specs/", "tests/", "proto/", "api/", ".github/"}
+	for _, prefix := range protectedPrefixes {
+		if cleaned == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(cleaned, prefix) {
+			return true
+		}
+	}
+
+	return strings.HasSuffix(cleaned, ".proto") || strings.HasSuffix(cleaned, "_test.go")
 }
 
 // AccountClient defines account-level operations for the authenticated GitHub user.

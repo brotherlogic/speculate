@@ -26,6 +26,9 @@ type MockClient struct {
 	issues        map[int]*Issue                     // number -> Issue
 	issueComments map[int][]string                   // number -> comment bodies
 	prs           map[int]*PullRequest               // number -> PullRequest
+	prReviews     map[int][]*PullRequestReview       // prNumber -> reviews
+	checkRuns     map[string][]*CheckRun             // ref -> check runs
+	changedFiles  map[string][]string                // "base...head" -> changed file paths
 	files         map[string]map[string]*FileContent // ref -> path -> FileContent
 	nextIssueNum  int
 	nextPRNum     int
@@ -41,6 +44,9 @@ func NewMockClient(owner, repo string) *MockClient {
 		issues:        make(map[int]*Issue),
 		issueComments: make(map[int][]string),
 		prs:           make(map[int]*PullRequest),
+		prReviews:     make(map[int][]*PullRequestReview),
+		checkRuns:     make(map[string][]*CheckRun),
+		changedFiles:  make(map[string][]string),
 		files:         make(map[string]map[string]*FileContent),
 		nextIssueNum:  1,
 		nextPRNum:     1,
@@ -52,14 +58,27 @@ func NewMockClient(owner, repo string) *MockClient {
 	m.branches["refs/heads/main"] = mainSHA
 
 	// Seed with initial README.md
-	m.files["main"] = map[string]*FileContent{
+	initialFiles := map[string]*FileContent{
 		"README.md": {
 			Content: "# " + repo + "\n\nInitial repository README.\n",
 			SHA:     sha1String("initial-readme"),
 		},
 	}
+	m.files["main"] = initialFiles
+	m.files[mainSHA] = copyFileMap(initialFiles)
 
 	return m
+}
+
+func copyFileMap(src map[string]*FileContent) map[string]*FileContent {
+	dst := make(map[string]*FileContent, len(src))
+	for p, fc := range src {
+		dst[p] = &FileContent{
+			Content: fc.Content,
+			SHA:     fc.SHA,
+		}
+	}
+	return dst
 }
 
 func (m *MockClient) Owner() string { return m.owner }
@@ -110,23 +129,14 @@ func (m *MockClient) CreateBranch(ctx context.Context, branch, baseBranchOrSHA s
 
 	// Copy files from base branch if available
 	if baseFiles, ok := m.files[baseBranchOrSHA]; ok {
-		branchFiles := make(map[string]*FileContent)
-		for p, fc := range baseFiles {
-			branchFiles[p] = &FileContent{
-				Content: fc.Content,
-				SHA:     fc.SHA,
-			}
-		}
-		m.files[branch] = branchFiles
+		m.files[branch] = copyFileMap(baseFiles)
+	} else if shaFiles, ok := m.files[sha]; ok {
+		m.files[branch] = copyFileMap(shaFiles)
 	} else if mainFiles, ok := m.files["main"]; ok {
-		branchFiles := make(map[string]*FileContent)
-		for p, fc := range mainFiles {
-			branchFiles[p] = &FileContent{
-				Content: fc.Content,
-				SHA:     fc.SHA,
-			}
-		}
-		m.files[branch] = branchFiles
+		m.files[branch] = copyFileMap(mainFiles)
+	}
+	if _, ok := m.files[sha]; !ok && m.files[branch] != nil {
+		m.files[sha] = copyFileMap(m.files[branch])
 	}
 
 	return &Branch{
@@ -144,6 +154,46 @@ func (m *MockClient) DeleteBranch(ctx context.Context, branch string) error {
 	delete(m.branches, "refs/heads/"+branch)
 	delete(m.files, branch)
 	return nil
+}
+
+// ResetBranch force-updates a branch reference to targetSHA.
+func (m *MockClient) ResetBranch(ctx context.Context, branch, targetSHA string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleanBranch := strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
+	if _, ok := m.branches[cleanBranch]; !ok {
+		if _, okRef := m.branches["refs/heads/"+cleanBranch]; !okRef {
+			return fmt.Errorf("branch %q not found", cleanBranch)
+		}
+	}
+
+	m.branches[cleanBranch] = targetSHA
+	m.branches["refs/heads/"+cleanBranch] = targetSHA
+	if snapshot, ok := m.files[targetSHA]; ok {
+		m.files[cleanBranch] = copyFileMap(snapshot)
+	}
+	for _, pr := range m.prs {
+		if pr.State == "open" && !pr.Merged && pr.Head == cleanBranch {
+			pr.HeadSHA = targetSHA
+		}
+	}
+	return nil
+}
+
+// SetBranchSHA sets the commit SHA for a branch in memory (test helper).
+func (m *MockClient) SetBranchSHA(branch, sha string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cleanBranch := strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
+	m.branches[cleanBranch] = sha
+	m.branches["refs/heads/"+cleanBranch] = sha
+	for _, pr := range m.prs {
+		if pr.State == "open" && !pr.Merged && pr.Head == cleanBranch {
+			pr.HeadSHA = sha
+		}
+	}
 }
 
 // EnsureLabels creates or updates labels in memory.
@@ -212,6 +262,50 @@ func (m *MockClient) AddIssueComment(ctx context.Context, number int, body strin
 		return fmt.Errorf("issue #%d not found", number)
 	}
 	m.issueComments[number] = append(m.issueComments[number], body)
+	return nil
+}
+
+// AddIssueLabels appends unique labels to an existing issue in memory.
+func (m *MockClient) AddIssueLabels(ctx context.Context, number int, labels []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	iss, ok := m.issues[number]
+	if !ok {
+		return fmt.Errorf("issue #%d not found", number)
+	}
+	existing := make(map[string]struct{}, len(iss.Labels))
+	for _, l := range iss.Labels {
+		existing[l] = struct{}{}
+	}
+	for _, l := range labels {
+		if l == "" {
+			continue
+		}
+		if _, dup := existing[l]; !dup {
+			iss.Labels = append(iss.Labels, l)
+			existing[l] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// RemoveIssueLabel removes a label from an existing issue in memory idempotently.
+func (m *MockClient) RemoveIssueLabel(ctx context.Context, number int, label string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	iss, ok := m.issues[number]
+	if !ok {
+		return fmt.Errorf("issue #%d not found", number)
+	}
+	filtered := make([]string, 0, len(iss.Labels))
+	for _, l := range iss.Labels {
+		if l != label {
+			filtered = append(filtered, l)
+		}
+	}
+	iss.Labels = filtered
 	return nil
 }
 
@@ -296,6 +390,16 @@ func (m *MockClient) FindOpenIssueByLabel(ctx context.Context, label string) (*I
 	return issues[0], nil
 }
 
+func (m *MockClient) copyPullRequestLocked(pr *PullRequest) *PullRequest {
+	copied := *pr
+	if copied.State == "open" && !copied.Merged {
+		if sha, ok := m.branches[copied.Head]; ok && sha != "" {
+			copied.HeadSHA = sha
+		}
+	}
+	return &copied
+}
+
 // CreatePullRequest opens a pull request.
 func (m *MockClient) CreatePullRequest(ctx context.Context, req *CreatePRRequest) (*PullRequest, error) {
 	m.mu.Lock()
@@ -304,10 +408,20 @@ func (m *MockClient) CreatePullRequest(ctx context.Context, req *CreatePRRequest
 	num := m.nextPRNum
 	m.nextPRNum++
 
+	cleanHead := strings.TrimPrefix(strings.TrimSpace(req.Head), "refs/heads/")
+	headSHA := m.branches[cleanHead]
+	if headSHA == "" {
+		headSHA = m.branches["refs/heads/"+cleanHead]
+	}
+	if headSHA == "" {
+		headSHA = sha1String("pr-head-" + cleanHead)
+	}
+
 	pr := &PullRequest{
 		Number:  num,
 		Title:   req.Title,
-		Head:    req.Head,
+		Head:    cleanHead,
+		HeadSHA: headSHA,
 		Base:    req.Base,
 		State:   "open",
 		Merged:  false,
@@ -315,7 +429,7 @@ func (m *MockClient) CreatePullRequest(ctx context.Context, req *CreatePRRequest
 	}
 
 	m.prs[num] = pr
-	return pr, nil
+	return m.copyPullRequestLocked(pr), nil
 }
 
 // GetPullRequest retrieves a PR by number.
@@ -327,7 +441,170 @@ func (m *MockClient) GetPullRequest(ctx context.Context, number int) (*PullReque
 	if !ok {
 		return nil, fmt.Errorf("pull request #%d not found", number)
 	}
-	return pr, nil
+	return m.copyPullRequestLocked(pr), nil
+}
+
+// FindOpenPullRequestByHead returns the first open pull request with matching head branch, or nil.
+func (m *MockClient) FindOpenPullRequestByHead(ctx context.Context, headBranch string) (*PullRequest, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cleanHead := strings.TrimPrefix(strings.TrimSpace(headBranch), "refs/heads/")
+	for i := 1; i < m.nextPRNum; i++ {
+		pr, ok := m.prs[i]
+		if !ok {
+			continue
+		}
+		if pr.State == "open" && !pr.Merged && pr.Head == cleanHead {
+			return m.copyPullRequestLocked(pr), nil
+		}
+	}
+	return nil, nil
+}
+
+// AddPullRequestReview appends a review to a PR in memory (test helper).
+func (m *MockClient) AddPullRequestReview(prNumber int, review *PullRequestReview) {
+	if review == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	copied := *review
+	m.prReviews[prNumber] = append(m.prReviews[prNumber], &copied)
+}
+
+// SetPullRequestReviews replaces all reviews for a PR in memory (test helper).
+func (m *MockClient) SetPullRequestReviews(prNumber int, reviews []*PullRequestReview) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	copied := make([]*PullRequestReview, 0, len(reviews))
+	for _, r := range reviews {
+		if r == nil {
+			continue
+		}
+		rc := *r
+		copied = append(copied, &rc)
+	}
+	m.prReviews[prNumber] = copied
+}
+
+// ListPullRequestReviews returns a defensive copy of reviews for prNumber.
+func (m *MockClient) ListPullRequestReviews(ctx context.Context, prNumber int) ([]*PullRequestReview, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	reviews := m.prReviews[prNumber]
+	copied := make([]*PullRequestReview, 0, len(reviews))
+	for _, r := range reviews {
+		rc := *r
+		copied = append(copied, &rc)
+	}
+	return copied, nil
+}
+
+// SetCheckRunsForRef replaces check runs for a given git ref or SHA (test helper).
+func (m *MockClient) SetCheckRunsForRef(ref string, runs []*CheckRun) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	copied := make([]*CheckRun, 0, len(runs))
+	for _, cr := range runs {
+		if cr == nil {
+			continue
+		}
+		c := *cr
+		copied = append(copied, &c)
+	}
+	m.checkRuns[ref] = copied
+}
+
+// AddCheckRunForRef appends a check run for a given git ref or SHA (test helper).
+func (m *MockClient) AddCheckRunForRef(ref string, run *CheckRun) {
+	if run == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	c := *run
+	m.checkRuns[ref] = append(m.checkRuns[ref], &c)
+}
+
+// ListCheckRunsForRef returns a defensive copy of check runs for ref.
+func (m *MockClient) ListCheckRunsForRef(ctx context.Context, ref string) ([]*CheckRun, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	runs := m.checkRuns[ref]
+	copied := make([]*CheckRun, 0, len(runs))
+	for _, cr := range runs {
+		c := *cr
+		copied = append(copied, &c)
+	}
+	return copied, nil
+}
+
+// SetChangedFiles configures an explicit file diff result for baseRef...headRef (test helper).
+func (m *MockClient) SetChangedFiles(baseRef, headRef string, files []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	copied := make([]string, len(files))
+	copy(copied, files)
+	m.changedFiles[baseRef+"..."+headRef] = copied
+}
+
+// ListChangedFiles returns configured changed files or diffs the in-memory file snapshots for baseRef and headRef.
+func (m *MockClient) ListChangedFiles(ctx context.Context, baseRef, headRef string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if files, ok := m.changedFiles[baseRef+"..."+headRef]; ok {
+		copied := make([]string, len(files))
+		copy(copied, files)
+		return copied, nil
+	}
+
+	resolveFiles := func(ref string) map[string]*FileContent {
+		if f, ok := m.files[ref]; ok {
+			return f
+		}
+		clean := strings.TrimPrefix(strings.TrimSpace(ref), "refs/heads/")
+		if f, ok := m.files[clean]; ok {
+			return f
+		}
+		if sha, ok := m.branches[clean]; ok {
+			if f, ok := m.files[sha]; ok {
+				return f
+			}
+		}
+		return nil
+	}
+
+	baseFiles := resolveFiles(baseRef)
+	headFiles := resolveFiles(headRef)
+
+	changedSet := make(map[string]struct{})
+	for path, headFC := range headFiles {
+		baseFC, exists := baseFiles[path]
+		if !exists || baseFC.SHA != headFC.SHA || baseFC.Content != headFC.Content {
+			changedSet[path] = struct{}{}
+		}
+	}
+	for path := range baseFiles {
+		if _, exists := headFiles[path]; !exists {
+			changedSet[path] = struct{}{}
+		}
+	}
+
+	changed := make([]string, 0, len(changedSet))
+	for path := range changedSet {
+		changed = append(changed, path)
+	}
+	sort.Strings(changed)
+	return changed, nil
 }
 
 // SquashMergePullRequest marks PR as merged.
@@ -400,16 +677,27 @@ func (m *MockClient) UpdateFile(ctx context.Context, path, content, sha, branch,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	branchFiles, ok := m.files[branch]
+	cleanBranch := strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
+	branchFiles, ok := m.files[cleanBranch]
 	if !ok {
 		branchFiles = make(map[string]*FileContent)
-		m.files[branch] = branchFiles
+		m.files[cleanBranch] = branchFiles
 	}
 
 	newSHA := sha1String(content)
 	branchFiles[path] = &FileContent{
 		Content: content,
 		SHA:     newSHA,
+	}
+
+	branchSHA := sha1String(fmt.Sprintf("%s:%s:%s", cleanBranch, path, newSHA))
+	m.branches[cleanBranch] = branchSHA
+	m.branches["refs/heads/"+cleanBranch] = branchSHA
+	m.files[branchSHA] = copyFileMap(branchFiles)
+	for _, pr := range m.prs {
+		if pr.State == "open" && !pr.Merged && pr.Head == cleanBranch {
+			pr.HeadSHA = branchSHA
+		}
 	}
 
 	return nil
