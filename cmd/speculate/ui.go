@@ -33,10 +33,13 @@ type RepoRowView struct {
 	RepoURL             string
 	StageLabel          string
 	StageBadgeClass     string
+	AttemptBadge        string
 	AlignmentPercentage int32
 	ShowAlignment       bool
 	IssueURL            string
 	IssueLabel          string
+	PRURL               string
+	PRLabel             string
 	LastCheckedUTC      string
 	LastCheckedRelative string
 	StatusMessage       string
@@ -119,6 +122,12 @@ func buildDashboardData(records []*pb.EnrollmentRecord, now time.Time) Dashboard
 		stage := rec.GetStage()
 		stageLabel, stageClass := stagePresentation(stage)
 
+		var attemptBadge string
+		if attempts := rec.GetAttemptCount(); attempts > 0 &&
+			(stage == pb.LifecycleStage_LIFECYCLE_STAGE_EVALUATING || stage == pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNING) {
+			attemptBadge = fmt.Sprintf("Attempt %d/3", attempts)
+		}
+
 		pct := rec.GetAlignmentPercentage()
 		if pct < 0 {
 			pct = 0
@@ -127,6 +136,15 @@ func buildDashboardData(records []*pb.EnrollmentRecord, now time.Time) Dashboard
 		}
 
 		issueURL, issueLabel := extractIssueLink(rec.GetIssueUrl())
+		var prURL, prLabel string
+		if prNum := rec.GetActivePrNumber(); prNum > 0 && repo != "" {
+			candidatePRURL := fmt.Sprintf("https://github.com/%s/pull/%d", strings.TrimPrefix(repo, "/"), prNum)
+			if !strings.EqualFold(issueURL, candidatePRURL) {
+				prURL = candidatePRURL
+				prLabel = fmt.Sprintf("PR #%d", prNum)
+			}
+		}
+
 		lastUTC, lastRel := formatLastChecked(rec.GetLastEvaluatedAtUnix(), now)
 		lastErr := strings.TrimSpace(rec.GetLastError())
 		statusMsg := strings.TrimSpace(rec.GetStatusMessage())
@@ -143,10 +161,13 @@ func buildDashboardData(records []*pb.EnrollmentRecord, now time.Time) Dashboard
 			RepoURL:             repoURL,
 			StageLabel:          stageLabel,
 			StageBadgeClass:     stageClass,
+			AttemptBadge:        attemptBadge,
 			AlignmentPercentage: pct,
 			ShowAlignment:       stage != pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_SEED,
 			IssueURL:            issueURL,
 			IssueLabel:          issueLabel,
+			PRURL:               prURL,
+			PRLabel:             prLabel,
 			LastCheckedUTC:      lastUTC,
 			LastCheckedRelative: lastRel,
 			StatusMessage:       statusMsg,
@@ -377,6 +398,19 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
     .stage-aligned { background-color: #059669; }
     .stage-unspecified { background-color: #6b7280; }
 
+    .attempt-badge {
+      display: inline-block;
+      margin-left: 0.35rem;
+      padding: 0.15rem 0.5rem;
+      border-radius: 9999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      background-color: var(--bg-subtle);
+      color: var(--text-primary);
+      border: 1px solid var(--border-subtle);
+      white-space: nowrap;
+    }
+
     .status-note {
       margin-top: 0.35rem;
       font-size: 0.8rem;
@@ -504,7 +538,7 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
               {{if .RepoURL}}<a href="{{.RepoURL}}" target="_blank" rel="noopener noreferrer">{{.Repository}}</a>{{else}}<span>—</span>{{end}}
             </td>
             <td>
-              <span class="stage-badge {{.StageBadgeClass}}">{{.StageLabel}}</span>
+              <span class="stage-badge {{.StageBadgeClass}}">{{.StageLabel}}</span>{{if .AttemptBadge}}<span class="attempt-badge">{{.AttemptBadge}}</span>{{end}}
               {{if .StatusMessage}}<div class="status-note">{{.StatusMessage}}</div>{{end}}
               {{if .LastError}}<div class="error-callout" role="alert">Warning: {{.LastError}}</div>{{end}}
             </td>
@@ -521,7 +555,7 @@ const dashboardHTMLTemplate = `<!DOCTYPE html>
               {{end}}
             </td>
             <td>
-              {{if .IssueURL}}<a href="{{.IssueURL}}" target="_blank" rel="noopener noreferrer">{{.IssueLabel}}</a>{{else}}<span class="muted">—</span>{{end}}
+              {{if or .IssueURL .PRURL}}{{if .IssueURL}}<a href="{{.IssueURL}}" target="_blank" rel="noopener noreferrer">{{.IssueLabel}}</a>{{end}}{{if and .IssueURL .PRURL}} <span class="muted">·</span> {{end}}{{if .PRURL}}<a href="{{.PRURL}}" target="_blank" rel="noopener noreferrer">{{.PRLabel}}</a>{{end}}{{else}}<span class="muted">—</span>{{end}}
             </td>
             <td>
               <div class="timestamp-rel">{{.LastCheckedRelative}}</div>

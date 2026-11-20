@@ -1,9 +1,10 @@
 module github.com/brotherlogic/speculate
 
-go 1.25.0
+go 1.26.3
 
 require (
 	github.com/brotherlogic/devcontainer-manager v0.0.0-20261003225116-9a2bc73953df
+	github.com/brotherlogic/ghwebhook v0.0.8
 	github.com/brotherlogic/pstore v0.73.0
 	github.com/google/go-github/v50 v50.2.0
 	github.com/prometheus/client_golang v1.24.1
@@ -24,9 +25,9 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 )

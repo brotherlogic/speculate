@@ -810,4 +810,85 @@ func TestInitHTTPMux_Routes(t *testing.T) {
 	})
 }
 
+func TestParseDaemonConfig_Phase4Flags(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		for _, env := range []string{"DCM_ADDR", "DCM_HARNESS", "DCM_MODEL", "GHWEBHOOK_ADDR", "SELF_GRPC_ADDR"} {
+			t.Setenv(env, "")
+		}
+
+		cfg := parseDaemonConfig([]string{})
+		if cfg.DCMAddr != "" {
+			t.Errorf("cfg.DCMAddr = %q, want empty", cfg.DCMAddr)
+		}
+		if cfg.DCMHarness != "antigravity" {
+			t.Errorf("cfg.DCMHarness = %q, want %q", cfg.DCMHarness, "antigravity")
+		}
+		if cfg.DCMModel != "" {
+			t.Errorf("cfg.DCMModel = %q, want empty", cfg.DCMModel)
+		}
+		if cfg.GHWebhookAddr != "" {
+			t.Errorf("cfg.GHWebhookAddr = %q, want empty", cfg.GHWebhookAddr)
+		}
+		if cfg.SelfGRPCAddr != "speculate.speculate.svc:50051" {
+			t.Errorf("cfg.SelfGRPCAddr = %q, want %q", cfg.SelfGRPCAddr, "speculate.speculate.svc:50051")
+		}
+	})
+
+	t.Run("reads environment variables", func(t *testing.T) {
+		t.Setenv("DCM_ADDR", "dcm.dcm.svc:50051")
+		t.Setenv("DCM_HARNESS", "pi")
+		t.Setenv("DCM_MODEL", "gemini-2.5-pro")
+		t.Setenv("GHWEBHOOK_ADDR", "ghwebhook.ghwebhook.svc:50051")
+		t.Setenv("SELF_GRPC_ADDR", "speculate.custom.svc:50051")
+
+		cfg := parseDaemonConfig([]string{})
+		if cfg.DCMAddr != "dcm.dcm.svc:50051" {
+			t.Errorf("cfg.DCMAddr = %q, want dcm.dcm.svc:50051", cfg.DCMAddr)
+		}
+		if cfg.DCMHarness != "pi" {
+			t.Errorf("cfg.DCMHarness = %q, want pi", cfg.DCMHarness)
+		}
+		if cfg.DCMModel != "gemini-2.5-pro" {
+			t.Errorf("cfg.DCMModel = %q, want gemini-2.5-pro", cfg.DCMModel)
+		}
+		if cfg.GHWebhookAddr != "ghwebhook.ghwebhook.svc:50051" {
+			t.Errorf("cfg.GHWebhookAddr = %q, want ghwebhook.ghwebhook.svc:50051", cfg.GHWebhookAddr)
+		}
+		if cfg.SelfGRPCAddr != "speculate.custom.svc:50051" {
+			t.Errorf("cfg.SelfGRPCAddr = %q, want speculate.custom.svc:50051", cfg.SelfGRPCAddr)
+		}
+	})
+
+	t.Run("CLI flags override env vars and empty values fall back to defaults", func(t *testing.T) {
+		t.Setenv("DCM_ADDR", "env-dcm:50051")
+		t.Setenv("DCM_HARNESS", "pi")
+		t.Setenv("DCM_MODEL", "env-model")
+		t.Setenv("GHWEBHOOK_ADDR", "env-ghwebhook:50051")
+		t.Setenv("SELF_GRPC_ADDR", "env-self:50051")
+
+		cfg := parseDaemonConfig([]string{
+			"--dcm-addr=flag-dcm:50051",
+			"--dcm-harness=",
+			"--dcm-model=flag-model",
+			"--ghwebhook-addr=flag-ghwebhook:50051",
+			"--self-grpc-addr=",
+		})
+		if cfg.DCMAddr != "flag-dcm:50051" {
+			t.Errorf("cfg.DCMAddr = %q, want flag-dcm:50051", cfg.DCMAddr)
+		}
+		if cfg.DCMHarness != "antigravity" {
+			t.Errorf("cfg.DCMHarness = %q, want fallback antigravity", cfg.DCMHarness)
+		}
+		if cfg.DCMModel != "flag-model" {
+			t.Errorf("cfg.DCMModel = %q, want flag-model", cfg.DCMModel)
+		}
+		if cfg.GHWebhookAddr != "flag-ghwebhook:50051" {
+			t.Errorf("cfg.GHWebhookAddr = %q, want flag-ghwebhook:50051", cfg.GHWebhookAddr)
+		}
+		if cfg.SelfGRPCAddr != "speculate.speculate.svc:50051" {
+			t.Errorf("cfg.SelfGRPCAddr = %q, want fallback speculate.speculate.svc:50051", cfg.SelfGRPCAddr)
+		}
+	})
+}
+
 

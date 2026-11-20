@@ -12,9 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	ghwebhookpb "github.com/brotherlogic/ghwebhook/proto/ghwebhook/v1"
+	"github.com/brotherlogic/speculate/pkg/dcm"
 	"github.com/brotherlogic/speculate/pkg/enroll"
 	"github.com/brotherlogic/speculate/pkg/evaluator"
 	ghclient "github.com/brotherlogic/speculate/pkg/github"
@@ -24,6 +27,7 @@ import (
 	pb "github.com/brotherlogic/speculate/proto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
@@ -34,6 +38,11 @@ type DaemonConfig struct {
 	OllamaEndpoint string
 	TargetRepo     string
 	SyncInterval   time.Duration
+	DCMAddr        string
+	DCMHarness     string
+	DCMModel       string
+	GHWebhookAddr  string
+	SelfGRPCAddr   string
 }
 
 func parseDaemonConfig(args []string) *DaemonConfig {
@@ -72,15 +81,42 @@ func parseDaemonConfig(args []string) *DaemonConfig {
 		}
 	}
 
+	dcmAddr := os.Getenv("DCM_ADDR")
+
+	dcmHarness := os.Getenv("DCM_HARNESS")
+	if strings.TrimSpace(dcmHarness) == "" {
+		dcmHarness = "antigravity"
+	}
+
+	dcmModel := os.Getenv("DCM_MODEL")
+
+	ghWebhookAddr := os.Getenv("GHWEBHOOK_ADDR")
+
+	selfGRPCAddr := os.Getenv("SELF_GRPC_ADDR")
+	if strings.TrimSpace(selfGRPCAddr) == "" {
+		selfGRPCAddr = "speculate.speculate.svc:50051"
+	}
+
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.IntVar(&httpPort, "http-port", httpPort, "HTTP server port")
 	fs.IntVar(&grpcPort, "grpc-port", grpcPort, "gRPC server port")
 	fs.StringVar(&ollamaEndpoint, "ollama-endpoint", ollamaEndpoint, "Ollama LLM API endpoint")
 	fs.StringVar(&targetRepo, "target-repo", targetRepo, "Target repository (owner/repo)")
 	fs.DurationVar(&syncInterval, "sync-interval", syncInterval, "Interval between collaborator discovery sync cycles")
+	fs.StringVar(&dcmAddr, "dcm-addr", dcmAddr, "devcontainer-manager (DCM) gRPC address")
+	fs.StringVar(&dcmHarness, "dcm-harness", dcmHarness, "DCM agent harness (antigravity or pi)")
+	fs.StringVar(&dcmModel, "dcm-model", dcmModel, "Optional DCM LLM model override")
+	fs.StringVar(&ghWebhookAddr, "ghwebhook-addr", ghWebhookAddr, "ghwebhook gRPC address for automatic repository registration")
+	fs.StringVar(&selfGRPCAddr, "self-grpc-addr", selfGRPCAddr, "Speculate gRPC service address advertised to ghwebhook")
 	_ = fs.Parse(args)
 	if syncInterval <= 0 {
 		syncInterval = enroll.DefaultSyncInterval
+	}
+	if strings.TrimSpace(dcmHarness) == "" {
+		dcmHarness = "antigravity"
+	}
+	if strings.TrimSpace(selfGRPCAddr) == "" {
+		selfGRPCAddr = "speculate.speculate.svc:50051"
 	}
 
 	return &DaemonConfig{
@@ -89,6 +125,11 @@ func parseDaemonConfig(args []string) *DaemonConfig {
 		OllamaEndpoint: ollamaEndpoint,
 		TargetRepo:     targetRepo,
 		SyncInterval:   syncInterval,
+		DCMAddr:        dcmAddr,
+		DCMHarness:     dcmHarness,
+		DCMModel:       dcmModel,
+		GHWebhookAddr:  ghWebhookAddr,
+		SelfGRPCAddr:   selfGRPCAddr,
 	}
 }
 
@@ -161,13 +202,45 @@ func runDaemon(args []string) {
 	eval := evaluator.NewEvaluator(evalClient)
 	synth := synthesizer.NewSynthesizer(evalClient)
 
-	pipeline := enroll.NewPipeline(ghToken, nil, eval, synth, store)
+	harness, err := dcm.ParseHarness(cfg.DCMHarness)
+	if err != nil {
+		log.Printf("Warning: invalid DCM harness %q (%v); defaulting to antigravity", cfg.DCMHarness, err)
+		harness = dcm.HarnessAntigravity
+	}
+
+	pipeline := enroll.NewPipeline(ghToken, nil, eval, synth, store).
+		WithHarness(harness).
+		WithModel(cfg.DCMModel)
+
+	if strings.TrimSpace(cfg.DCMAddr) != "" {
+		dcmClient, err := dcm.NewRealClient(ctx, cfg.DCMAddr)
+		if err != nil {
+			log.Printf("Warning: failed to connect to DCM at %s: %v; continuing in card-only mode", cfg.DCMAddr, err)
+		} else {
+			defer dcmClient.Close()
+			pipeline.WithDCMClient(dcmClient)
+			log.Printf("DCM client configured at %s (harness=%s)", cfg.DCMAddr, cfg.DCMHarness)
+		}
+	}
+
 	speculateServer := NewSpeculateServer(pipeline)
 	pb.RegisterSpeculateServiceServer(grpcServer, speculateServer)
+	ghwebhookpb.RegisterWebhookHandlerServer(grpcServer, NewWebhookServer(pipeline))
 
 	if ghToken != "" {
 		accountClient := ghclient.NewRealAccountClient(ghToken)
 		syncer := enroll.NewSyncer(accountClient, store, pipeline)
+		if strings.TrimSpace(cfg.GHWebhookAddr) != "" {
+			ghWebhookConn, err := grpc.NewClient(cfg.GHWebhookAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Printf("Warning: failed to dial ghwebhook at %s: %v; automatic webhook registration is disabled", cfg.GHWebhookAddr, err)
+			} else {
+				defer ghWebhookConn.Close()
+				regClient := ghwebhookpb.NewRegistrationServiceClient(ghWebhookConn)
+				syncer.WithWebhookRegistrar(enroll.NewGRPCWebhookRegistrar(regClient), cfg.SelfGRPCAddr)
+				log.Printf("ghwebhook registration enabled (addr=%s, self=%s)", cfg.GHWebhookAddr, cfg.SelfGRPCAddr)
+			}
+		}
 		go syncer.Run(ctx, cfg.SyncInterval)
 	} else {
 		log.Printf("Warning: GH_TOKEN / GITHUB_TOKEN not set; automatic collaborator discovery is disabled")
