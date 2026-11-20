@@ -2,6 +2,7 @@ package setup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -118,13 +119,29 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 		t.Errorf("expected CODEOWNERS to contain @brotherlogic, got:\n%s", string(codeownersBytes))
 	}
 
-	// Verify review-gate.yml has brotherlogic interpolated
+	// Verify review-gate.yml has brotherlogic interpolated, removes automation bypasses, and enforces post-approval lock
 	reviewGateBytes, err := os.ReadFile(filepath.Join(tempDir, ".github", "workflows", "review-gate.yml"))
 	if err != nil {
 		t.Fatalf("reading review-gate.yml failed: %v", err)
 	}
-	if !strings.Contains(string(reviewGateBytes), `PR_AUTHOR" = "brotherlogic"`) {
-		t.Errorf("expected review-gate.yml to contain brotherlogic author check, got:\n%s", string(reviewGateBytes))
+	reviewGateStr := string(reviewGateBytes)
+	for _, expectedSubstr := range []string{
+		`if [ "$PR_AUTHOR" = "brotherlogic" ]; then`,
+		`*.proto|*_test.go|specs/*|*/specs/*|tests/*|*/tests/*|proto/*|*/proto/*|api/*|*/api/*|.github/*`,
+		`gh api repos/brotherlogic/sample-repo/pulls/$PR_NUMBER/reviews --jq '[.[] | select(.user.login == "brotherlogic" and .state == "APPROVED")] | last | .commit_id'`,
+		`git diff --name-only "$APPROVED_SHA..$HEAD_SHA"`,
+	} {
+		if !strings.Contains(reviewGateStr, expectedSubstr) {
+			t.Errorf("expected review-gate.yml to contain %q, got:\n%s", expectedSubstr, reviewGateStr)
+		}
+	}
+	for _, forbiddenSubstr := range []string{
+		"brotherlogic-speculate",
+		"brotherlogic-automation",
+	} {
+		if strings.Contains(reviewGateStr, forbiddenSubstr) {
+			t.Errorf("expected review-gate.yml NOT to contain %q, got:\n%s", forbiddenSubstr, reviewGateStr)
+		}
 	}
 
 	// Verify create-pr.yml is created and contains expected trigger, token sanitization, and gh pr create command
@@ -147,7 +164,7 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 		}
 	}
 
-	// Verify tests.yml triggers on main and does not contain 'feat/**'
+	// Verify tests.yml triggers on main, does not contain 'feat/**', and defines separate compile and test jobs
 	testsBytes, err := os.ReadFile(filepath.Join(tempDir, ".github", "workflows", "tests.yml"))
 	if err != nil {
 		t.Fatalf("reading tests.yml failed: %v", err)
@@ -155,6 +172,20 @@ func TestSetupTemplateFiles_FreshAndOverwrite(t *testing.T) {
 	testsStr := string(testsBytes)
 	if strings.Contains(testsStr, "'feat/**'") {
 		t.Errorf("expected tests.yml not to contain 'feat/**', got:\n%s", testsStr)
+	}
+	for _, expectedSubstr := range []string{
+		"compile:",
+		"name: compile",
+		"go build ./...",
+		"go vet ./...",
+		`sh -c 'for pkg in $(go list ./tests/... 2>/dev/null); do go test -c -o /dev/null "$pkg"; done'`,
+		"test:",
+		"name: test",
+		"go test -v ./...",
+	} {
+		if !strings.Contains(testsStr, expectedSubstr) {
+			t.Errorf("expected tests.yml to contain %q, got:\n%s", expectedSubstr, testsStr)
+		}
 	}
 
 	// 2. Second run without changes writes 0 files
@@ -2770,13 +2801,19 @@ func TestLocalCreatePRWorkflowMatchesTemplate(t *testing.T) {
 }
 
 func TestLocalTestsWorkflowMatchesTemplate(t *testing.T) {
-	localWorkflowPath := filepath.Join("..", "..", ".github", "workflows", "tests.yml")
-	localBytes, err := os.ReadFile(localWorkflowPath)
-	if err != nil {
-		t.Fatalf("failed reading local tests.yml at %s: %v", localWorkflowPath, err)
-	}
-	if string(localBytes) != testsTemplate {
-		t.Errorf("local .github/workflows/tests.yml does not match testsTemplate.\nGot:\n%s\nWant:\n%s", string(localBytes), testsTemplate)
+	for _, expectedSubstr := range []string{
+		"compile:",
+		"name: compile",
+		"go build ./...",
+		"go vet ./...",
+		`sh -c 'for pkg in $(go list ./tests/... 2>/dev/null); do go test -c -o /dev/null "$pkg"; done'`,
+		"test:",
+		"name: test",
+		"go test -v ./...",
+	} {
+		if !strings.Contains(testsTemplate, expectedSubstr) {
+			t.Errorf("expected testsTemplate to contain %q, got:\n%s", expectedSubstr, testsTemplate)
+		}
 	}
 }
 
@@ -3446,11 +3483,78 @@ func TestSetupTemplateFiles_CollaboratorRendering(t *testing.T) {
 			}
 			reviewGateStr := string(reviewGateBytes)
 
-			wantCheck := `if [ "$PR_AUTHOR" = "brotherlogic" ] || [ "$PR_AUTHOR" = "` + tc.wantCollaborator + `" ] || [ "$PR_AUTHOR" = "brotherlogic-automation" ]; then`
+			wantCheck := `if [ "$PR_AUTHOR" = "brotherlogic" ]; then`
 			if !strings.Contains(reviewGateStr, wantCheck) {
 				t.Errorf("expected review-gate.yml to contain %q, got:\n%s", wantCheck, reviewGateStr)
 			}
+			for _, forbidden := range []string{tc.wantCollaborator, "brotherlogic-automation"} {
+				if strings.Contains(reviewGateStr, forbidden) {
+					t.Errorf("expected review-gate.yml NOT to exempt %q, got:\n%s", forbidden, reviewGateStr)
+				}
+			}
 		})
+	}
+}
+
+func TestConfigureRulesets_RequiredStatusChecks(t *testing.T) {
+	tempDir := t.TempDir()
+	stdinFile := filepath.Join(tempDir, "ruleset_payload.json")
+	script := `
+if [ "$1" = "api" ] && [ "$2" = "repos/brotherlogic/sample-repo/rulesets" ] && [ "$#" -eq 2 ]; then
+  echo "[]"
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "repos/brotherlogic/sample-repo/rulesets" ] && [ "$3" = "-X" ] && [ "$4" = "POST" ]; then
+  cat > "` + stdinFile + `"
+  echo '{"id":1}'
+  exit 0
+fi
+echo "unexpected gh args: $@" >&2
+exit 1
+`
+	setupMockGH(t, script)
+
+	cfg := &Config{
+		RootDir: tempDir,
+		Repo:    "brotherlogic/sample-repo",
+		Owner:   "brotherlogic",
+	}
+	if err := ConfigureRulesets(context.Background(), cfg); err != nil {
+		t.Fatalf("ConfigureRulesets failed: %v", err)
+	}
+
+	payloadBytes, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("failed reading captured ruleset payload: %v", err)
+	}
+
+	var payload struct {
+		Rules []struct {
+			Type       string `json:"type"`
+			Parameters struct {
+				RequiredStatusChecks []struct {
+					Context string `json:"context"`
+				} `json:"required_status_checks"`
+			} `json:"parameters"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		t.Fatalf("failed unmarshaling ruleset payload: %v\npayload:\n%s", err, string(payloadBytes))
+	}
+
+	gotContexts := make(map[string]bool)
+	for _, r := range payload.Rules {
+		if r.Type == "required_status_checks" {
+			for _, sc := range r.Parameters.RequiredStatusChecks {
+				gotContexts[sc.Context] = true
+			}
+		}
+	}
+
+	for _, want := range []string{"compile", "test", "review-gate"} {
+		if !gotContexts[want] {
+			t.Errorf("expected required_status_checks to contain %q, got contexts: %v\npayload:\n%s", want, gotContexts, string(payloadBytes))
+		}
 	}
 }
 

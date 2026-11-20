@@ -235,9 +235,17 @@ func SetupTemplateFiles(cfg *Config) ([]string, error) {
 	if collaborator == "" {
 		collaborator = DefaultCollaborator
 	}
+	owner := strings.TrimSpace(cfg.Owner)
+	repo := strings.TrimSpace(cfg.Repo)
+	if parts := strings.SplitN(repo, "/", 2); len(parts) == 2 {
+		if owner == "" {
+			owner = strings.TrimSpace(parts[0])
+		}
+		repo = strings.TrimSpace(parts[1])
+	}
 	tmplCtx := TemplateContext{
-		Owner:        cfg.Owner,
-		Repo:         cfg.Repo,
+		Owner:        owner,
+		Repo:         repo,
 		Collaborator: collaborator,
 	}
 
@@ -764,6 +772,7 @@ func ConfigureRulesets(ctx context.Context, cfg *Config) error {
 					"strict_required_status_checks_policy": false,
 					"do_not_enforce_on_create":             false,
 					"required_status_checks": []map[string]string{
+						{"context": "compile"},
 						{"context": "test"},
 						{"context": "review-gate"},
 					},
