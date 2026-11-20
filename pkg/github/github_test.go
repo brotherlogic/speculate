@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v50/github"
 )
@@ -1128,4 +1129,518 @@ func TestMockAccountClient(t *testing.T) {
 			t.Fatalf("expected error %v when listCollaboratorErr is set, got %v", listCollabErr, err)
 		}
 	})
+}
+
+func TestIsProtectedPath(t *testing.T) {
+	tests := []struct {
+		relPath string
+		want    bool
+	}{
+		{"proto/kv/v1/kv.proto", true},
+		{"internal/custom.proto", true},
+		{"tests/kv_test.go", true},
+		{"internal/server/kv_test.go", true},
+		{"specs/kv.md", true},
+		{"specs/nested/auth.md", true},
+		{"tests/helpers/setup.go", true},
+		{"proto/buf.yaml", true},
+		{"api/v1/service.go", true},
+		{".github/workflows/tests.yml", true},
+		{".github/CODEOWNERS", true},
+		{"./specs/kv.md", true},
+		{"/tests/kv_test.go", true},
+		{"internal/server/kv.go", false},
+		{"cmd/server/main.go", false},
+		{"README.md", false},
+		{"go.mod", false},
+		{"pkg/service/handler.go", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		if got := IsProtectedPath(tt.relPath); got != tt.want {
+			t.Errorf("IsProtectedPath(%q) = %v, want %v", tt.relPath, got, tt.want)
+		}
+	}
+}
+
+func TestRealClient_Phase4Extensions(t *testing.T) {
+	ctx := context.Background()
+	mux := http.NewServeMux()
+
+	submittedAt := time.Date(2026, 11, 19, 12, 30, 0, 0, time.UTC)
+
+	// Mock PR creation, listing, and get with HeadSHA
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/pulls", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			var newPR gh.NewPullRequest
+			if err := json.NewDecoder(r.Body).Decode(&newPR); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			pr := &gh.PullRequest{
+				Number:  gh.Int(10),
+				Title:   newPR.Title,
+				Head:    &gh.PullRequestBranch{Ref: newPR.Head, SHA: gh.String("sha-created-123")},
+				Base:    &gh.PullRequestBranch{Ref: newPR.Base},
+				State:   gh.String("open"),
+				Merged:  gh.Bool(false),
+				HTMLURL: gh.String("https://github.com/brotherlogic/speculate-kv/pull/10"),
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(pr)
+		case http.MethodGet:
+			if gotState := r.URL.Query().Get("state"); gotState != "open" {
+				t.Errorf("expected state=open, got %q", gotState)
+			}
+			head := r.URL.Query().Get("head")
+			if head == "brotherlogic:feat/core" {
+				_ = json.NewEncoder(w).Encode([]*gh.PullRequest{
+					{
+						Number:  gh.Int(10),
+						Title:   gh.String("feat: core scenario"),
+						Head:    &gh.PullRequestBranch{Ref: gh.String("feat/core"), SHA: gh.String("sha-head-open")},
+						Base:    &gh.PullRequestBranch{Ref: gh.String("main")},
+						State:   gh.String("open"),
+						Merged:  gh.Bool(false),
+						HTMLURL: gh.String("https://github.com/brotherlogic/speculate-kv/pull/10"),
+					},
+				})
+				return
+			}
+			if head == "brotherlogic:feat/missing" {
+				_ = json.NewEncoder(w).Encode([]*gh.PullRequest{})
+				return
+			}
+			t.Errorf("unexpected head query parameter: %q", head)
+			_ = json.NewEncoder(w).Encode([]*gh.PullRequest{})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/pulls/10", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(&gh.PullRequest{
+			Number:  gh.Int(10),
+			Title:   gh.String("feat: core scenario"),
+			Head:    &gh.PullRequestBranch{Ref: gh.String("feat/core"), SHA: gh.String("sha-get-456")},
+			Base:    &gh.PullRequestBranch{Ref: gh.String("main")},
+			State:   gh.String("open"),
+			Merged:  gh.Bool(false),
+			HTMLURL: gh.String("https://github.com/brotherlogic/speculate-kv/pull/10"),
+		})
+	})
+
+	// Mock PR reviews endpoint
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/pulls/10/reviews", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]*gh.PullRequestReview{
+			{
+				ID:          gh.Int64(501),
+				User:        &gh.User{Login: gh.String("brotherlogic")},
+				State:       gh.String("APPROVED"),
+				CommitID:    gh.String("sha-approved"),
+				SubmittedAt: &gh.Timestamp{Time: submittedAt},
+			},
+		})
+	})
+
+	// Mock check-runs endpoint
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/commits/sha-red-123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(&gh.ListCheckRunsResults{
+			Total: gh.Int(3),
+			CheckRuns: []*gh.CheckRun{
+				{
+					ID:         gh.Int64(1),
+					Name:       gh.String("compile"),
+					Status:     gh.String("completed"),
+					Conclusion: gh.String("success"),
+					DetailsURL: gh.String("https://github.com/brotherlogic/speculate-kv/actions/runs/1/job/1"),
+					Output:     &gh.CheckRunOutput{Summary: gh.String("go test -c succeeded")},
+				},
+				{
+					ID:         gh.Int64(2),
+					Name:       gh.String("test"),
+					Status:     gh.String("completed"),
+					Conclusion: gh.String("failure"),
+					DetailsURL: gh.String("https://github.com/brotherlogic/speculate-kv/actions/runs/1/job/2"),
+					Output:     &gh.CheckRunOutput{Text: gh.String("FAIL TestPut_Basic")},
+				},
+				{
+					ID:         gh.Int64(3),
+					Name:       gh.String("review-gate"),
+					Status:     gh.String("completed"),
+					Conclusion: gh.String("success"),
+					DetailsURL: gh.String("https://github.com/brotherlogic/speculate-kv/actions/runs/1/job/3"),
+					Output:     &gh.CheckRunOutput{Title: gh.String("No protected files modified")},
+				},
+			},
+		})
+	})
+
+	// Mock compare commits endpoint
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/compare/sha-approved...sha-head", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{
+			Files: []*gh.CommitFile{
+				{Filename: gh.String("internal/server/kv.go")},
+				{Filename: gh.String("tests/kv_test.go"), PreviousFilename: gh.String("tests/old_kv_test.go")},
+			},
+		})
+	})
+
+	// Mock git ref PATCH endpoint for ResetBranch
+	var resetCalled bool
+	var resetSHA string
+	var resetForce bool
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/git/refs/heads/feat/core", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var payload struct {
+			SHA   string `json:"sha"`
+			Force bool   `json:"force"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resetCalled = true
+		resetSHA = payload.SHA
+		resetForce = payload.Force
+		_ = json.NewEncoder(w).Encode(&gh.Reference{
+			Ref:    gh.String("refs/heads/feat/core"),
+			Object: &gh.GitObject{SHA: gh.String(payload.SHA)},
+		})
+	})
+
+	// Mock issue labels add & idempotent remove endpoints
+	var addedLabels []string
+	var removeCount int
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/issues/42/labels", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&addedLabels); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var resp []*gh.Label
+		for _, l := range addedLabels {
+			name := l
+			resp = append(resp, &gh.Label{Name: &name})
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("/repos/brotherlogic/speculate-kv/issues/42/labels/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		label := strings.TrimPrefix(r.URL.Path, "/repos/brotherlogic/speculate-kv/issues/42/labels/")
+		if label != LabelStalled {
+			t.Errorf("expected delete label %q, got %q", LabelStalled, label)
+		}
+		removeCount++
+		if removeCount == 1 {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode([]*gh.Label{})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "Label does not exist"})
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewRealClient("fake-token", "brotherlogic", "speculate-kv", WithBaseURL(server.URL))
+
+	// 1. CreatePullRequest and GetPullRequest populate HeadSHA
+	createdPR, err := client.CreatePullRequest(ctx, &CreatePRRequest{
+		Title: "feat: core scenario",
+		Head:  "feat/core",
+		Base:  "main",
+		Body:  "Closes #1",
+	})
+	if err != nil {
+		t.Fatalf("CreatePullRequest failed: %v", err)
+	}
+	if createdPR.HeadSHA != "sha-created-123" {
+		t.Errorf("CreatePullRequest HeadSHA = %q, want %q", createdPR.HeadSHA, "sha-created-123")
+	}
+
+	gotPR, err := client.GetPullRequest(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPullRequest failed: %v", err)
+	}
+	if gotPR.HeadSHA != "sha-get-456" {
+		t.Errorf("GetPullRequest HeadSHA = %q, want %q", gotPR.HeadSHA, "sha-get-456")
+	}
+
+	// 2. FindOpenPullRequestByHead (found vs none open)
+	foundPR, err := client.FindOpenPullRequestByHead(ctx, "feat/core")
+	if err != nil {
+		t.Fatalf("FindOpenPullRequestByHead(feat/core) failed: %v", err)
+	}
+	if foundPR == nil || foundPR.Number != 10 || foundPR.HeadSHA != "sha-head-open" {
+		t.Errorf("unexpected FindOpenPullRequestByHead result: %+v", foundPR)
+	}
+
+	missingPR, err := client.FindOpenPullRequestByHead(ctx, "feat/missing")
+	if err != nil {
+		t.Fatalf("FindOpenPullRequestByHead(feat/missing) failed: %v", err)
+	}
+	if missingPR != nil {
+		t.Errorf("expected nil PR for feat/missing, got %+v", missingPR)
+	}
+
+	// 3. ListPullRequestReviews
+	reviews, err := client.ListPullRequestReviews(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListPullRequestReviews failed: %v", err)
+	}
+	if len(reviews) != 1 {
+		t.Fatalf("expected 1 review, got %d", len(reviews))
+	}
+	if reviews[0].ID != 501 || reviews[0].Author != "brotherlogic" || reviews[0].State != "APPROVED" || reviews[0].CommitID != "sha-approved" || !reviews[0].SubmittedAt.Equal(submittedAt) {
+		t.Errorf("unexpected review: %+v", reviews[0])
+	}
+
+	// 4. ListCheckRunsForRef
+	runs, err := client.ListCheckRunsForRef(ctx, "sha-red-123")
+	if err != nil {
+		t.Fatalf("ListCheckRunsForRef failed: %v", err)
+	}
+	if len(runs) != 3 {
+		t.Fatalf("expected 3 check runs, got %d", len(runs))
+	}
+	if runs[0].Name != "compile" || runs[0].Status != "completed" || runs[0].Conclusion != "success" || runs[0].OutputSummary != "go test -c succeeded" {
+		t.Errorf("unexpected compile check run: %+v", runs[0])
+	}
+	if runs[1].Name != "test" || runs[1].Conclusion != "failure" || runs[1].OutputSummary != "FAIL TestPut_Basic" {
+		t.Errorf("unexpected test check run: %+v", runs[1])
+	}
+	if runs[2].Name != "review-gate" || runs[2].Conclusion != "success" || runs[2].OutputSummary != "No protected files modified" {
+		t.Errorf("unexpected review-gate check run: %+v", runs[2])
+	}
+
+	// 5. ListChangedFiles
+	changed, err := client.ListChangedFiles(ctx, "sha-approved", "sha-head")
+	if err != nil {
+		t.Fatalf("ListChangedFiles failed: %v", err)
+	}
+	wantChanged := "internal/server/kv.go,tests/kv_test.go,tests/old_kv_test.go"
+	if strings.Join(changed, ",") != wantChanged {
+		t.Errorf("ListChangedFiles = %v, want [%s]", changed, wantChanged)
+	}
+
+	// 6. ResetBranch
+	if err := client.ResetBranch(ctx, "feat/core", "sha-approved"); err != nil {
+		t.Fatalf("ResetBranch failed: %v", err)
+	}
+	if !resetCalled || !resetForce || resetSHA != "sha-approved" {
+		t.Errorf("unexpected ResetBranch call state: called=%v force=%v sha=%q", resetCalled, resetForce, resetSHA)
+	}
+
+	// 7. AddIssueLabels and idempotent RemoveIssueLabel
+	if err := client.AddIssueLabels(ctx, 42, []string{LabelStalled}); err != nil {
+		t.Fatalf("AddIssueLabels failed: %v", err)
+	}
+	if strings.Join(addedLabels, ",") != LabelStalled {
+		t.Errorf("expected added labels [%s], got %v", LabelStalled, addedLabels)
+	}
+	if err := client.RemoveIssueLabel(ctx, 42, LabelStalled); err != nil {
+		t.Fatalf("first RemoveIssueLabel failed: %v", err)
+	}
+	if err := client.RemoveIssueLabel(ctx, 42, LabelStalled); err != nil {
+		t.Fatalf("idempotent second RemoveIssueLabel (404) failed: %v", err)
+	}
+}
+
+func TestMockClient_Phase4Extensions(t *testing.T) {
+	ctx := context.Background()
+	client := NewMockClient("brotherlogic", "speculate-kv")
+
+	// 1. Branch + PR creation + FindOpenPullRequestByHead
+	branch, err := client.CreateBranch(ctx, "feat/core", "main")
+	if err != nil {
+		t.Fatalf("CreateBranch failed: %v", err)
+	}
+	approvedSHA := branch.SHA
+
+	noneOpen, err := client.FindOpenPullRequestByHead(ctx, "feat/core")
+	if err != nil {
+		t.Fatalf("FindOpenPullRequestByHead failed: %v", err)
+	}
+	if noneOpen != nil {
+		t.Errorf("expected nil open PR before CreatePullRequest, got %+v", noneOpen)
+	}
+
+	pr, err := client.CreatePullRequest(ctx, &CreatePRRequest{
+		Title: "feat: core scenario",
+		Head:  "feat/core",
+		Base:  "main",
+		Body:  "Closes #1",
+	})
+	if err != nil {
+		t.Fatalf("CreatePullRequest failed: %v", err)
+	}
+	if pr.HeadSHA != approvedSHA {
+		t.Errorf("expected CreatePullRequest HeadSHA %q, got %q", approvedSHA, pr.HeadSHA)
+	}
+
+	foundPR, err := client.FindOpenPullRequestByHead(ctx, "feat/core")
+	if err != nil {
+		t.Fatalf("FindOpenPullRequestByHead failed: %v", err)
+	}
+	if foundPR == nil || foundPR.Number != pr.Number || foundPR.HeadSHA != approvedSHA {
+		t.Errorf("unexpected FindOpenPullRequestByHead result: %+v", foundPR)
+	}
+
+	// 2. ListPullRequestReviews
+	reviewTime := time.Date(2026, 11, 19, 15, 0, 0, 0, time.UTC)
+	client.AddPullRequestReview(pr.Number, &PullRequestReview{
+		ID:          101,
+		Author:      "brotherlogic",
+		State:       "APPROVED",
+		CommitID:    approvedSHA,
+		SubmittedAt: reviewTime,
+	})
+	reviews, err := client.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		t.Fatalf("ListPullRequestReviews failed: %v", err)
+	}
+	if len(reviews) != 1 || reviews[0].State != "APPROVED" || reviews[0].CommitID != approvedSHA || reviews[0].Author != "brotherlogic" {
+		t.Fatalf("unexpected reviews: %+v", reviews)
+	}
+
+	// 3. ListCheckRunsForRef & defensive copy
+	client.SetCheckRunsForRef(approvedSHA, []*CheckRun{
+		{ID: 1, Name: "compile", Status: "completed", Conclusion: "success", OutputSummary: "ok"},
+		{ID: 2, Name: "test", Status: "completed", Conclusion: "failure", OutputSummary: "red test"},
+		{ID: 3, Name: "review-gate", Status: "completed", Conclusion: "success", OutputSummary: "clean"},
+	})
+	runs, err := client.ListCheckRunsForRef(ctx, approvedSHA)
+	if err != nil {
+		t.Fatalf("ListCheckRunsForRef failed: %v", err)
+	}
+	if len(runs) != 3 || runs[0].Name != "compile" || runs[1].Conclusion != "failure" || runs[2].Name != "review-gate" {
+		t.Fatalf("unexpected check runs: %+v", runs)
+	}
+	runs[0].Conclusion = "mutated"
+	runsAgain, _ := client.ListCheckRunsForRef(ctx, approvedSHA)
+	if runsAgain[0].Conclusion != "success" {
+		t.Errorf("expected ListCheckRunsForRef to return defensive copy, got %q", runsAgain[0].Conclusion)
+	}
+
+	// 4. ListChangedFiles via UpdateFile diff and via SetChangedFiles override, plus ResetBranch
+	if err := client.UpdateFile(ctx, "tests/kv_test.go", "package tests\n// tampered\n", "", "feat/core", "tamper test"); err != nil {
+		t.Fatalf("UpdateFile failed: %v", err)
+	}
+	updatedBranch, err := client.GetBranch(ctx, "feat/core")
+	if err != nil {
+		t.Fatalf("GetBranch after UpdateFile failed: %v", err)
+	}
+	if updatedBranch.SHA == approvedSHA {
+		t.Fatalf("expected UpdateFile to advance branch SHA from %q", approvedSHA)
+	}
+
+	diffFiles, err := client.ListChangedFiles(ctx, approvedSHA, updatedBranch.SHA)
+	if err != nil {
+		t.Fatalf("ListChangedFiles failed: %v", err)
+	}
+	if strings.Join(diffFiles, ",") != "tests/kv_test.go" {
+		t.Errorf("expected diff [tests/kv_test.go], got %v", diffFiles)
+	}
+
+	client.SetChangedFiles("base-sha", "head-sha", []string{"internal/kv.go", "internal/store.go"})
+	explicitDiff, err := client.ListChangedFiles(ctx, "base-sha", "head-sha")
+	if err != nil {
+		t.Fatalf("ListChangedFiles override failed: %v", err)
+	}
+	if strings.Join(explicitDiff, ",") != "internal/kv.go,internal/store.go" {
+		t.Errorf("expected explicit diff [internal/kv.go internal/store.go], got %v", explicitDiff)
+	}
+
+	if err := client.ResetBranch(ctx, "feat/core", approvedSHA); err != nil {
+		t.Fatalf("ResetBranch failed: %v", err)
+	}
+	resetBranch, err := client.GetBranch(ctx, "feat/core")
+	if err != nil {
+		t.Fatalf("GetBranch after ResetBranch failed: %v", err)
+	}
+	if resetBranch.SHA != approvedSHA {
+		t.Errorf("expected reset branch SHA %q, got %q", approvedSHA, resetBranch.SHA)
+	}
+	prAfterReset, err := client.GetPullRequest(ctx, pr.Number)
+	if err != nil {
+		t.Fatalf("GetPullRequest after ResetBranch failed: %v", err)
+	}
+	if prAfterReset.HeadSHA != approvedSHA {
+		t.Errorf("expected PR HeadSHA reset to %q, got %q", approvedSHA, prAfterReset.HeadSHA)
+	}
+	if err := client.ResetBranch(ctx, "feat/nonexistent", approvedSHA); err == nil {
+		t.Errorf("expected ResetBranch on nonexistent branch to return error")
+	}
+
+	// 5. AddIssueLabels & idempotent RemoveIssueLabel
+	iss, err := client.CreateIssue(ctx, &CreateIssueRequest{
+		Title:  "[Speculate Align] Core-1",
+		Body:   "Align",
+		Labels: []string{LabelAlign},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+	if err := client.AddIssueLabels(ctx, iss.Number, []string{LabelStalled, LabelAlign}); err != nil {
+		t.Fatalf("AddIssueLabels failed: %v", err)
+	}
+	gotIss, err := client.GetIssue(ctx, iss.Number)
+	if err != nil {
+		t.Fatalf("GetIssue failed: %v", err)
+	}
+	if strings.Join(gotIss.Labels, ",") != LabelAlign+","+LabelStalled {
+		t.Errorf("expected labels [%s %s], got %v", LabelAlign, LabelStalled, gotIss.Labels)
+	}
+
+	if err := client.RemoveIssueLabel(ctx, iss.Number, LabelStalled); err != nil {
+		t.Fatalf("RemoveIssueLabel failed: %v", err)
+	}
+	if err := client.RemoveIssueLabel(ctx, iss.Number, LabelStalled); err != nil {
+		t.Fatalf("idempotent RemoveIssueLabel failed: %v", err)
+	}
+	gotIssAfterRemove, _ := client.GetIssue(ctx, iss.Number)
+	if strings.Join(gotIssAfterRemove.Labels, ",") != LabelAlign {
+		t.Errorf("expected labels [%s], got %v", LabelAlign, gotIssAfterRemove.Labels)
+	}
+
+	// 6. Merging PR removes it from FindOpenPullRequestByHead
+	if _, err := client.SquashMergePullRequest(ctx, pr.Number, "merge", "body"); err != nil {
+		t.Fatalf("SquashMergePullRequest failed: %v", err)
+	}
+	closedFind, err := client.FindOpenPullRequestByHead(ctx, "feat/core")
+	if err != nil {
+		t.Fatalf("FindOpenPullRequestByHead after merge failed: %v", err)
+	}
+	if closedFind != nil {
+		t.Errorf("expected nil open PR after merge, got %+v", closedFind)
+	}
 }

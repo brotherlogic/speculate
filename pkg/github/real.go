@@ -230,6 +230,22 @@ func (c *RealClient) DeleteBranch(ctx context.Context, branch string) error {
 	return nil
 }
 
+// ResetBranch force-updates refs/heads/<branch> to point to targetSHA.
+func (c *RealClient) ResetBranch(ctx context.Context, branch, targetSHA string) error {
+	cleanBranch := strings.TrimPrefix(strings.TrimSpace(branch), "refs/heads/")
+	refName := "refs/heads/" + cleanBranch
+	ref := &github.Reference{
+		Ref: github.String(refName),
+		Object: &github.GitObject{
+			SHA: github.String(targetSHA),
+		},
+	}
+	if _, _, err := c.ghClient.Git.UpdateRef(ctx, c.owner, c.repo, ref, true); err != nil {
+		return fmt.Errorf("resetting branch %q to %s: %w", cleanBranch, targetSHA, err)
+	}
+	return nil
+}
+
 // EnsureLabels verifies required labels exist on the repo and creates any that are missing.
 func (c *RealClient) EnsureLabels(ctx context.Context, labels []Label) error {
 	for _, l := range labels {
@@ -347,6 +363,29 @@ func (c *RealClient) AddIssueComment(ctx context.Context, number int, body strin
 	return nil
 }
 
+// AddIssueLabels adds labels to an existing GitHub issue.
+func (c *RealClient) AddIssueLabels(ctx context.Context, number int, labels []string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	if _, _, err := c.ghClient.Issues.AddLabelsToIssue(ctx, c.owner, c.repo, number, labels); err != nil {
+		return fmt.Errorf("adding labels %v to issue #%d: %w", labels, number, err)
+	}
+	return nil
+}
+
+// RemoveIssueLabel removes a label from a GitHub issue, ignoring HTTP 404 idempotently.
+func (c *RealClient) RemoveIssueLabel(ctx context.Context, number int, label string) error {
+	resp, err := c.ghClient.Issues.RemoveLabelForIssue(ctx, c.owner, c.repo, number, label)
+	if resp != nil && resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("removing label %q from issue #%d: %w", label, number, err)
+	}
+	return nil
+}
+
 // ListIssues queries existing issues by state and labels.
 func (c *RealClient) ListIssues(ctx context.Context, state string, labels []string) ([]*Issue, error) {
 	opts := &github.IssueListByRepoOptions{
@@ -398,6 +437,19 @@ func (c *RealClient) FindOpenIssueByLabel(ctx context.Context, label string) (*I
 	return issues[0], nil
 }
 
+func toPullRequest(pr *github.PullRequest) *PullRequest {
+	return &PullRequest{
+		Number:  pr.GetNumber(),
+		Title:   pr.GetTitle(),
+		Head:    pr.GetHead().GetRef(),
+		HeadSHA: pr.GetHead().GetSHA(),
+		Base:    pr.GetBase().GetRef(),
+		State:   pr.GetState(),
+		Merged:  pr.GetMerged(),
+		HTMLURL: pr.GetHTMLURL(),
+	}
+}
+
 // CreatePullRequest opens a pull request.
 func (c *RealClient) CreatePullRequest(ctx context.Context, req *CreatePRRequest) (*PullRequest, error) {
 	prReq := &github.NewPullRequest{
@@ -412,15 +464,7 @@ func (c *RealClient) CreatePullRequest(ctx context.Context, req *CreatePRRequest
 		return nil, fmt.Errorf("creating PR %q (%s -> %s): %w", req.Title, req.Head, req.Base, err)
 	}
 
-	return &PullRequest{
-		Number:  pr.GetNumber(),
-		Title:   pr.GetTitle(),
-		Head:    pr.GetHead().GetRef(),
-		Base:    pr.GetBase().GetRef(),
-		State:   pr.GetState(),
-		Merged:  pr.GetMerged(),
-		HTMLURL: pr.GetHTMLURL(),
-	}, nil
+	return toPullRequest(pr), nil
 }
 
 // GetPullRequest fetches PR details.
@@ -430,15 +474,186 @@ func (c *RealClient) GetPullRequest(ctx context.Context, number int) (*PullReque
 		return nil, fmt.Errorf("getting PR #%d: %w", number, err)
 	}
 
-	return &PullRequest{
-		Number:  pr.GetNumber(),
-		Title:   pr.GetTitle(),
-		Head:    pr.GetHead().GetRef(),
-		Base:    pr.GetBase().GetRef(),
-		State:   pr.GetState(),
-		Merged:  pr.GetMerged(),
-		HTMLURL: pr.GetHTMLURL(),
-	}, nil
+	return toPullRequest(pr), nil
+}
+
+// FindOpenPullRequestByHead returns the first open PR for headBranch, or nil if none exists.
+func (c *RealClient) FindOpenPullRequestByHead(ctx context.Context, headBranch string) (*PullRequest, error) {
+	cleanBranch := strings.TrimPrefix(strings.TrimSpace(headBranch), "refs/heads/")
+	if idx := strings.Index(cleanBranch, ":"); idx != -1 {
+		cleanBranch = cleanBranch[idx+1:]
+	}
+	if cleanBranch == "" {
+		return nil, nil
+	}
+
+	headFilter := cleanBranch
+	if c.owner != "" {
+		headFilter = c.owner + ":" + cleanBranch
+	}
+
+	for page := 1; ; {
+		prs, resp, err := c.ghClient.PullRequests.List(ctx, c.owner, c.repo, &github.PullRequestListOptions{
+			State: "open",
+			Head:  headFilter,
+			ListOptions: github.ListOptions{
+				PerPage: 100,
+				Page:    page,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("listing open pull requests for head %q: %w", cleanBranch, err)
+		}
+
+		for _, pr := range prs {
+			if pr == nil {
+				continue
+			}
+			ref := pr.GetHead().GetRef()
+			if ref == "" || ref == cleanBranch {
+				return toPullRequest(pr), nil
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	return nil, nil
+}
+
+// ListPullRequestReviews returns all reviews submitted on the given pull request.
+func (c *RealClient) ListPullRequestReviews(ctx context.Context, prNumber int) ([]*PullRequestReview, error) {
+	var reviews []*PullRequestReview
+
+	for page := 1; ; {
+		ghReviews, resp, err := c.ghClient.PullRequests.ListReviews(ctx, c.owner, c.repo, prNumber, &github.ListOptions{
+			PerPage: 100,
+			Page:    page,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("listing reviews for PR #%d: %w", prNumber, err)
+		}
+
+		for _, r := range ghReviews {
+			if r == nil {
+				continue
+			}
+			var submittedAt time.Time
+			if r.SubmittedAt != nil {
+				submittedAt = r.SubmittedAt.Time
+			}
+			reviews = append(reviews, &PullRequestReview{
+				ID:          r.GetID(),
+				Author:      r.GetUser().GetLogin(),
+				State:       r.GetState(),
+				CommitID:    r.GetCommitID(),
+				SubmittedAt: submittedAt,
+			})
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	return reviews, nil
+}
+
+// ListCheckRunsForRef returns check runs reported on the specified git ref or commit SHA.
+func (c *RealClient) ListCheckRunsForRef(ctx context.Context, ref string) ([]*CheckRun, error) {
+	var runs []*CheckRun
+
+	for page := 1; ; {
+		res, resp, err := c.ghClient.Checks.ListCheckRunsForRef(ctx, c.owner, c.repo, ref, &github.ListCheckRunsOptions{
+			ListOptions: github.ListOptions{
+				PerPage: 100,
+				Page:    page,
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("listing check runs for ref %q: %w", ref, err)
+		}
+
+		if res != nil {
+			for _, cr := range res.CheckRuns {
+				if cr == nil {
+					continue
+				}
+				var summary string
+				if out := cr.GetOutput(); out != nil {
+					summary = out.GetSummary()
+					if summary == "" {
+						summary = out.GetText()
+					}
+					if summary == "" {
+						summary = out.GetTitle()
+					}
+				}
+				runs = append(runs, &CheckRun{
+					ID:            cr.GetID(),
+					Name:          cr.GetName(),
+					Status:        cr.GetStatus(),
+					Conclusion:    cr.GetConclusion(),
+					DetailsURL:    cr.GetDetailsURL(),
+					OutputSummary: summary,
+				})
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	return runs, nil
+}
+
+// ListChangedFiles compares baseRef and headRef and returns the changed file paths.
+func (c *RealClient) ListChangedFiles(ctx context.Context, baseRef, headRef string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var files []string
+
+	for page := 1; ; {
+		comp, resp, err := c.ghClient.Repositories.CompareCommits(ctx, c.owner, c.repo, baseRef, headRef, &github.ListOptions{
+			PerPage: 100,
+			Page:    page,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("comparing commits %s...%s: %w", baseRef, headRef, err)
+		}
+
+		if comp != nil {
+			for _, f := range comp.Files {
+				if f == nil {
+					continue
+				}
+				if name := f.GetFilename(); name != "" {
+					if _, dup := seen[name]; !dup {
+						seen[name] = struct{}{}
+						files = append(files, name)
+					}
+				}
+				if prev := f.GetPreviousFilename(); prev != "" {
+					if _, dup := seen[prev]; !dup {
+						seen[prev] = struct{}{}
+						files = append(files, prev)
+					}
+				}
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		page = resp.NextPage
+	}
+
+	return files, nil
 }
 
 // SquashMergePullRequest performs a squash merge on a pull request.
