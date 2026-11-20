@@ -390,3 +390,94 @@ func TestDashboardHandler_ListerError(t *testing.T) {
 		}
 	})
 }
+
+func TestDashboardHandler_Phase4ActivePRAndAttemptBadge(t *testing.T) {
+	fixedNow := time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC)
+
+	lister := &mockEnrollmentLister{
+		listFn: func(ctx context.Context) ([]*pb.EnrollmentRecord, error) {
+			return []*pb.EnrollmentRecord{
+				{
+					Repository:          "brotherlogic/eval-pr",
+					Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_EVALUATING,
+					AlignmentPercentage: 30,
+					IssueUrl:            "https://github.com/brotherlogic/eval-pr/issues/11",
+					ActivePrNumber:      24,
+					AttemptCount:        2,
+					LastEvaluatedAtUnix: fixedNow.Add(-1 * time.Minute).Unix(),
+				},
+				{
+					Repository:          "brotherlogic/align-pr",
+					Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNING,
+					AlignmentPercentage: 70,
+					IssueUrl:            "",
+					ActivePrNumber:      35,
+					AttemptCount:        1,
+					LastEvaluatedAtUnix: fixedNow.Add(-2 * time.Minute).Unix(),
+				},
+				{
+					Repository:          "brotherlogic/review-pr",
+					Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_AWAITING_TEST_REVIEW,
+					AlignmentPercentage: 50,
+					IssueUrl:            "https://github.com/brotherlogic/review-pr/pull/18",
+					ActivePrNumber:      18,
+					AttemptCount:        2,
+					LastEvaluatedAtUnix: fixedNow.Add(-3 * time.Minute).Unix(),
+				},
+				{
+					Repository:          "brotherlogic/stalled-pr",
+					Stage:               pb.LifecycleStage_LIFECYCLE_STAGE_STALLED,
+					AlignmentPercentage: 40,
+					IssueUrl:            "https://github.com/brotherlogic/stalled-pr/issues/9",
+					AttemptCount:        3,
+					LastEvaluatedAtUnix: fixedNow.Add(-4 * time.Minute).Unix(),
+				},
+			}, nil
+		},
+	}
+
+	handler := newDashboardHandlerWithClock(lister, func() time.Time { return fixedNow })
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	body := rec.Body.String()
+
+	// Active PR links rendered alongside issue links (and when IssueUrl is empty)
+	for _, want := range []string{
+		`href="https://github.com/brotherlogic/eval-pr/issues/11"`,
+		"#11",
+		`href="https://github.com/brotherlogic/eval-pr/pull/24"`,
+		"PR #24",
+		`href="https://github.com/brotherlogic/align-pr/pull/35"`,
+		"PR #35",
+		"Attempt 2/3",
+		"Attempt 1/3",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rendered HTML missing %q", want)
+		}
+	}
+
+	// Attempt 3/3 must NOT be rendered for STALLED stage
+	if strings.Contains(body, "Attempt 3/3") {
+		t.Errorf("did not expect Attempt 3/3 badge outside Evaluating/Aligning stages")
+	}
+
+	// Verify AWAITING_TEST_REVIEW row does not show Attempt badge or duplicate pull/18 link
+	reviewRowRe := regexp.MustCompile(`(?s)<tr>\s*<td>[^<]*<a href="https://github\.com/brotherlogic/review-pr".*?</tr>`)
+	reviewRow := reviewRowRe.FindString(body)
+	if reviewRow == "" {
+		t.Fatalf("could not locate review-pr row")
+	}
+	if strings.Contains(reviewRow, "Attempt 2/3") {
+		t.Errorf("did not expect Attempt 2/3 badge in Awaiting Test Review row:\n%s", reviewRow)
+	}
+	if count := strings.Count(reviewRow, "https://github.com/brotherlogic/review-pr/pull/18"); count != 1 {
+		t.Errorf("expected pull/18 link once in review-pr row, got %d:\n%s", count, reviewRow)
+	}
+}

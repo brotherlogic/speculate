@@ -14,6 +14,8 @@ import (
 	"github.com/brotherlogic/speculate/pkg/pstore"
 	"github.com/brotherlogic/speculate/pkg/synthesizer"
 	pb "github.com/brotherlogic/speculate/proto"
+	ghwebhookpb "github.com/brotherlogic/ghwebhook/proto/ghwebhook/v1"
+	"google.golang.org/grpc"
 )
 
 type mockEnrollmentRunner struct {
@@ -460,4 +462,209 @@ func TestSyncOnce_ConcurrentWithPipelineEnrollSingleflightDeduplication(t *testi
 	if got := cloneCalls.Load(); got != 1 {
 		t.Errorf("expected concurrent SyncOnce + Pipeline.Enroll to deduplicate to 1 clone, got %d", got)
 	}
+}
+
+type registrarCall struct {
+	repo        string
+	serviceAddr string
+}
+
+type mockWebhookRegistrar struct {
+	mu              sync.Mutex
+	registerCalls   []registrarCall
+	unregisterCalls []registrarCall
+	registerErr     map[string]error
+	unregisterErr   map[string]error
+}
+
+func (m *mockWebhookRegistrar) Register(ctx context.Context, repo, serviceAddr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.registerCalls = append(m.registerCalls, registrarCall{repo: repo, serviceAddr: serviceAddr})
+	if err, ok := m.registerErr[repo]; ok {
+		return err
+	}
+	return nil
+}
+
+func (m *mockWebhookRegistrar) Unregister(ctx context.Context, repo, serviceAddr string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unregisterCalls = append(m.unregisterCalls, registrarCall{repo: repo, serviceAddr: serviceAddr})
+	if err, ok := m.unregisterErr[repo]; ok {
+		return err
+	}
+	return nil
+}
+
+func (m *mockWebhookRegistrar) RegisterCalls() []registrarCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]registrarCall, len(m.registerCalls))
+	copy(out, m.registerCalls)
+	return out
+}
+
+func (m *mockWebhookRegistrar) UnregisterCalls() []registrarCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]registrarCall, len(m.unregisterCalls))
+	copy(out, m.unregisterCalls)
+	return out
+}
+
+type mockRegistrationServiceClient struct {
+	registerReqs   []*ghwebhookpb.RegistrationRequest
+	unregisterReqs []*ghwebhookpb.UnregisterRequest
+	registerResp   *ghwebhookpb.RegistrationResponse
+	registerErr    error
+	unregisterResp *ghwebhookpb.UnregisterResponse
+	unregisterErr  error
+}
+
+func (m *mockRegistrationServiceClient) Register(ctx context.Context, in *ghwebhookpb.RegistrationRequest, opts ...grpc.CallOption) (*ghwebhookpb.RegistrationResponse, error) {
+	m.registerReqs = append(m.registerReqs, in)
+	if m.registerErr != nil {
+		return nil, m.registerErr
+	}
+	if m.registerResp != nil {
+		return m.registerResp, nil
+	}
+	return &ghwebhookpb.RegistrationResponse{Success: true, Message: "registered"}, nil
+}
+
+func (m *mockRegistrationServiceClient) Unregister(ctx context.Context, in *ghwebhookpb.UnregisterRequest, opts ...grpc.CallOption) (*ghwebhookpb.UnregisterResponse, error) {
+	m.unregisterReqs = append(m.unregisterReqs, in)
+	if m.unregisterErr != nil {
+		return nil, m.unregisterErr
+	}
+	if m.unregisterResp != nil {
+		return m.unregisterResp, nil
+	}
+	return &ghwebhookpb.UnregisterResponse{Success: true, Message: "unregistered"}, nil
+}
+
+func TestSyncOnce_RegistersActiveAndUnregistersPrunedRepos(t *testing.T) {
+	ctx := context.Background()
+	store := pstore.NewMockStore()
+
+	for _, repo := range []string{"brotherlogic/active-repo", "brotherlogic/removed-repo"} {
+		if err := store.SaveEnrollment(ctx, &pb.EnrollmentRecord{
+			Repository: repo,
+			Stage:      pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED,
+		}); err != nil {
+			t.Fatalf("SaveEnrollment(%s) failed: %v", repo, err)
+		}
+	}
+
+	accountClient := ghclient.NewMockAccountClient()
+	accountClient.SetCollaboratorRepositories([]string{"brotherlogic/active-repo", "brotherlogic/new-repo"})
+
+	runner := &mockEnrollmentRunner{store: store}
+	registrar := &mockWebhookRegistrar{}
+	const selfAddr = "speculate.speculate.svc:50051"
+
+	syncer := NewSyncer(accountClient, store, runner).WithWebhookRegistrar(registrar, selfAddr)
+	if err := syncer.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce returned unexpected error: %v", err)
+	}
+
+	wantReg := []registrarCall{
+		{repo: "brotherlogic/active-repo", serviceAddr: selfAddr},
+		{repo: "brotherlogic/new-repo", serviceAddr: selfAddr},
+	}
+	if got := registrar.RegisterCalls(); !reflect.DeepEqual(got, wantReg) {
+		t.Errorf("Register calls = %+v, want %+v", got, wantReg)
+	}
+
+	wantUnreg := []registrarCall{
+		{repo: "brotherlogic/removed-repo", serviceAddr: selfAddr},
+	}
+	if got := registrar.UnregisterCalls(); !reflect.DeepEqual(got, wantUnreg) {
+		t.Errorf("Unregister calls = %+v, want %+v", got, wantUnreg)
+	}
+}
+
+func TestSyncOnce_WebhookRegistrarErrorsDoNotAbortSync(t *testing.T) {
+	ctx := context.Background()
+	store := pstore.NewMockStore()
+
+	if err := store.SaveEnrollment(ctx, &pb.EnrollmentRecord{
+		Repository: "brotherlogic/removed-repo",
+		Stage:      pb.LifecycleStage_LIFECYCLE_STAGE_ALIGNED,
+	}); err != nil {
+		t.Fatalf("SaveEnrollment failed: %v", err)
+	}
+
+	accountClient := ghclient.NewMockAccountClient()
+	accountClient.SetCollaboratorRepositories([]string{"brotherlogic/repo-a", "brotherlogic/repo-b"})
+
+	runner := &mockEnrollmentRunner{store: store}
+	registrar := &mockWebhookRegistrar{
+		registerErr:   map[string]error{"brotherlogic/repo-a": errors.New("ghwebhook unavailable")},
+		unregisterErr: map[string]error{"brotherlogic/removed-repo": errors.New("ghwebhook timeout")},
+	}
+
+	syncer := NewSyncer(accountClient, store, runner).WithWebhookRegistrar(registrar, "speculate.speculate.svc:50051")
+	if err := syncer.SyncOnce(ctx); err != nil {
+		t.Fatalf("expected SyncOnce to continue past ghwebhook errors, got: %v", err)
+	}
+
+	if _, err := store.GetEnrollment(ctx, "brotherlogic/removed-repo"); !errors.Is(err, pstore.ErrNotFound) {
+		t.Errorf("expected removed-repo to still be pruned despite Unregister error, got err: %v", err)
+	}
+
+	wantEnroll := []string{"brotherlogic/repo-a", "brotherlogic/repo-b"}
+	if got := runner.Calls(); !reflect.DeepEqual(got, wantEnroll) {
+		t.Errorf("Enroll calls = %v, want %v (must not abort on Register error)", got, wantEnroll)
+	}
+
+	if len(registrar.RegisterCalls()) != 2 {
+		t.Errorf("expected 2 Register calls despite failure on repo-a, got %+v", registrar.RegisterCalls())
+	}
+	if len(registrar.UnregisterCalls()) != 1 {
+		t.Errorf("expected 1 Unregister call for removed-repo, got %+v", registrar.UnregisterCalls())
+	}
+}
+
+func TestGRPCWebhookRegistrar(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("register and unregister success", func(t *testing.T) {
+		client := &mockRegistrationServiceClient{}
+		reg := NewGRPCWebhookRegistrar(client)
+
+		if err := reg.Register(ctx, "brotherlogic/speculate-kv", "speculate.speculate.svc:50051"); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+		if err := reg.Unregister(ctx, "brotherlogic/speculate-kv", "speculate.speculate.svc:50051"); err != nil {
+			t.Fatalf("Unregister failed: %v", err)
+		}
+
+		if len(client.registerReqs) != 1 ||
+			client.registerReqs[0].GetRepoFullName() != "brotherlogic/speculate-kv" ||
+			client.registerReqs[0].GetServiceAddress() != "speculate.speculate.svc:50051" {
+			t.Errorf("unexpected Register requests: %+v", client.registerReqs)
+		}
+		if len(client.unregisterReqs) != 1 ||
+			client.unregisterReqs[0].GetRepoFullName() != "brotherlogic/speculate-kv" ||
+			client.unregisterReqs[0].GetServiceAddress() != "speculate.speculate.svc:50051" {
+			t.Errorf("unexpected Unregister requests: %+v", client.unregisterReqs)
+		}
+	})
+
+	t.Run("propagates RPC and rejected responses as errors", func(t *testing.T) {
+		client := &mockRegistrationServiceClient{
+			registerErr:    errors.New("dial failure"),
+			unregisterResp: &ghwebhookpb.UnregisterResponse{Success: false, Message: "not registered"},
+		}
+		reg := NewGRPCWebhookRegistrar(client)
+
+		if err := reg.Register(ctx, "brotherlogic/a", "addr:50051"); err == nil {
+			t.Error("expected Register error when RPC fails")
+		}
+		if err := reg.Unregister(ctx, "brotherlogic/a", "addr:50051"); err == nil {
+			t.Error("expected Unregister error when response Success=false")
+		}
+	})
 }

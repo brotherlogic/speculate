@@ -220,16 +220,17 @@ Once initialized, your repository is ready for autonomous spec-driven developmen
 
 ## Speculate Daemon, Collaborator Tracking & Web UI
 
-Running `speculate daemon` (the default command when invoked with no subcommand) starts both the gRPC `SpeculateService` server and the HTTP observability and dashboard server.
+Running `speculate daemon` (the default command when invoked with no subcommand) starts both the gRPC server (`SpeculateService` and `ghwebhook.v1.WebhookHandler`) and the HTTP observability and dashboard server.
 
-### Automatic Collaborator Tracking (`brotherlogic-speculate`)
+### Automatic Collaborator Tracking & Real-Time Webhooks (`brotherlogic-speculate`)
 
 When `GH_TOKEN` or `GITHUB_TOKEN` is configured for the `brotherlogic-speculate` account, the daemon runs a background collaborator `Syncer` on startup and on every `--sync-interval` (`SYNC_INTERVAL`, default `5m`):
 
 1. Automatically accepts pending GitHub collaboration invitations sent by `speculate init`.
 2. Discovers all active collaborator repositories and prunes repositories where collaborator access was removed.
-3. Evaluates each tracked repository across the six Speculate lifecycle stages (`Awaiting Seed`, `Evaluating`, `Awaiting Test Review`, `Aligning`, `Stalled`, and `Aligned`), preserving the last known stage alongside `last_error` if a transient check error occurs.
-4. Persists enrollment records to `pstore` (`PSTORE_ADDR`) wrapped with an in-memory `FallbackStore` so tracking and UI reads remain available during `pstore` outages.
+3. When `--ghwebhook-addr` (`GHWEBHOOK_ADDR`) is configured, automatically registers each active collaborator repository with `ghwebhook` (advertising `--self-grpc-addr`) and unregisters pruned repositories so incoming `push`, `pull_request`, `pull_request_review`, `check_suite`, and `issues` events trigger immediate asynchronous reconciliation via `ghwebhook.v1.WebhookHandler`.
+4. Evaluates each tracked repository across the six Speculate lifecycle stages (`Awaiting Seed`, `Evaluating`, `Awaiting Test Review`, `Aligning`, `Stalled`, and `Aligned`), preserving the last known stage alongside `last_error` if a transient check error occurs.
+5. Persists enrollment records to `pstore` (`PSTORE_ADDR`) wrapped with an in-memory `FallbackStore` so tracking and UI reads remain available during `pstore` outages.
 
 ### Phase 4 Red-to-Green Orchestrator (`pkg/orchestrator`)
 
@@ -245,14 +246,19 @@ The `pkg/orchestrator.Reconciler` (integrated with `pkg/enroll.Pipeline`) drives
 | Flag | Env Var | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--http-port` | `PORT`, `HTTP_PORT` | `8080` | HTTP server port (serves `GET /`, `/healthz`, `/status`, `/metrics`). |
-| `--grpc-port` | `GRPC_PORT` | `50051` | gRPC `SpeculateService` port (`Enroll`, `ListEnrollments`). |
+| `--grpc-port` | `GRPC_PORT` | `50051` | gRPC port serving `SpeculateService` (`Enroll`, `ListEnrollments`) and `ghwebhook.v1.WebhookHandler` (`ReceiveWebhook`). |
 | `--ollama-endpoint` | `OLLAMA_ENDPOINT` | `http://192.168.68.112:11434/v1` | Ollama LLM API endpoint. |
 | `--target-repo` | `TARGET_REPO` | `brotherlogic/speculate-kv` | Default target repository reported in `/status`. |
 | `--sync-interval` | `SYNC_INTERVAL` | `5m` | Interval between automatic collaborator discovery and evaluation cycles. |
+| `--dcm-addr` | `DCM_ADDR` | `""` | Optional `devcontainer-manager` (DCM) gRPC address for autonomous Red/Green sessions. |
+| `--dcm-harness` | `DCM_HARNESS` | `antigravity` | DCM agent harness (`antigravity` or `pi`). |
+| `--dcm-model` | `DCM_MODEL` | `""` | Optional LLM model override passed to DCM sessions. |
+| `--ghwebhook-addr` | `GHWEBHOOK_ADDR` | `""` | Optional `ghwebhook` gRPC address for automatic repository registration/unregistration. |
+| `--self-grpc-addr` | `SELF_GRPC_ADDR` | `speculate.speculate.svc:50051` | Speculate gRPC address advertised to `ghwebhook` during registration. |
 
 ### Read-Only Web UI Dashboard (`GET /`) & On-Demand `speculate enroll`
 
-- **Web Dashboard (`GET /`)**: Visit `http://localhost:8080/` to view a read-only HTML dashboard listing all tracked repositories, their current lifecycle stage pill, alignment progress bar, active GitHub issue/PR link, last checked timestamp (UTC and relative), and any inline check error callout.
+- **Web Dashboard (`GET /`)**: Visit `http://localhost:8080/` to view a read-only HTML dashboard listing all tracked repositories, their current lifecycle stage pill (alongside `Attempt <n>/3` during active `Evaluating` or `Aligning` strikes), alignment progress bar, active GitHub issue and PR links, last checked timestamp (UTC and relative), and any inline check error callout.
 - **On-Demand Check (`speculate enroll`)**: Trigger an immediate evaluation of a repository via gRPC without waiting for the next background sync tick:
   ```bash
   speculate enroll --daemon-addr=localhost:50051 <owner/repo>
