@@ -128,14 +128,22 @@ func TestEnrollMessages(t *testing.T) {
 	}
 
 	rec := &proto.EnrollmentRecord{
-		Repository:          "brotherlogic/speculate-kv",
-		AlignmentPercentage: 80,
-		IssueUrl:            "https://github.com/brotherlogic/speculate-kv/issues/1",
-		EnrolledAtUnix:      1700000000,
-		LastEvaluatedAtUnix: 1700000500,
-		StatusMessage:       "Enrolled",
-		Stage:               proto.LifecycleStage_LIFECYCLE_STAGE_STALLED,
-		LastError:           "ollama unreachable",
+		Repository:           "brotherlogic/speculate-kv",
+		AlignmentPercentage:  80,
+		IssueUrl:             "https://github.com/brotherlogic/speculate-kv/issues/1",
+		EnrolledAtUnix:       1700000000,
+		LastEvaluatedAtUnix:  1700000500,
+		StatusMessage:        "Enrolled",
+		Stage:                proto.LifecycleStage_LIFECYCLE_STAGE_STALLED,
+		LastError:            "ollama unreachable",
+		ActiveBranch:         "feat/put-get-delete",
+		ActivePrNumber:       12,
+		ActiveIssueNumber:    11,
+		ApprovedTestSha:      "abc1234deadbeef",
+		LastEvaluatedSha:     "def5678cafebabe",
+		AttemptCount:         2,
+		ActiveContainerId:    "dcm-container-42",
+		AttemptStartedAtUnix: 1700000400,
 	}
 	recBytes, err := goproto.Marshal(rec)
 	if err != nil {
@@ -152,7 +160,15 @@ func TestEnrollMessages(t *testing.T) {
 		decodedRec.GetLastEvaluatedAtUnix() != 1700000500 ||
 		decodedRec.GetStatusMessage() != "Enrolled" ||
 		decodedRec.GetStage() != proto.LifecycleStage_LIFECYCLE_STAGE_STALLED ||
-		decodedRec.GetLastError() != "ollama unreachable" {
+		decodedRec.GetLastError() != "ollama unreachable" ||
+		decodedRec.GetActiveBranch() != "feat/put-get-delete" ||
+		decodedRec.GetActivePrNumber() != 12 ||
+		decodedRec.GetActiveIssueNumber() != 11 ||
+		decodedRec.GetApprovedTestSha() != "abc1234deadbeef" ||
+		decodedRec.GetLastEvaluatedSha() != "def5678cafebabe" ||
+		decodedRec.GetAttemptCount() != 2 ||
+		decodedRec.GetActiveContainerId() != "dcm-container-42" ||
+		decodedRec.GetAttemptStartedAtUnix() != 1700000400 {
 		t.Fatalf("unexpected EnrollmentRecord fields after round-trip: %+v", &decodedRec)
 	}
 
@@ -195,7 +211,15 @@ func TestEnrollMessages(t *testing.T) {
 	if decodedLegacy.GetStage() != proto.LifecycleStage_LIFECYCLE_STAGE_UNSPECIFIED ||
 		decodedLegacy.GetLastError() != "" ||
 		decodedLegacy.GetRepository() != "brotherlogic/legacy-repo" ||
-		decodedLegacy.GetStatusMessage() != "Legacy record" {
+		decodedLegacy.GetStatusMessage() != "Legacy record" ||
+		decodedLegacy.GetActiveBranch() != "" ||
+		decodedLegacy.GetActivePrNumber() != 0 ||
+		decodedLegacy.GetActiveIssueNumber() != 0 ||
+		decodedLegacy.GetApprovedTestSha() != "" ||
+		decodedLegacy.GetLastEvaluatedSha() != "" ||
+		decodedLegacy.GetAttemptCount() != 0 ||
+		decodedLegacy.GetActiveContainerId() != "" ||
+		decodedLegacy.GetAttemptStartedAtUnix() != 0 {
 		t.Fatalf("unexpected decoded legacy EnrollmentRecord: %+v", &decodedLegacy)
 	}
 }
