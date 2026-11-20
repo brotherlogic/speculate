@@ -211,6 +211,11 @@ Once initialized, your repository is ready for autonomous spec-driven developmen
      --mode=evaluator \
      --target-repo=https://github.com/<owner>/<repo>
 
+   # End-to-end hermetic Phase 4 orchestrator simulation over bufconn
+   go run github.com/brotherlogic/speculate/cmd/prober@latest \
+     --mode=simulation \
+     --enable-issue-filing=false
+
    # Or via Docker
    docker run --rm ghcr.io/brotherlogic/speculate:latest \
      ./prober --mode=evaluator --target-repo=https://github.com/<owner>/<repo>
