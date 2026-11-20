@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/brotherlogic/speculate/pkg/dcm"
 	"github.com/brotherlogic/speculate/pkg/evaluator"
 	ghclient "github.com/brotherlogic/speculate/pkg/github"
 	"github.com/brotherlogic/speculate/pkg/pstore"
@@ -1200,6 +1201,63 @@ func TestPipeline_ListEnrollments(t *testing.T) {
 			t.Errorf("expected sorted records [alpha, zeta], got [%s, %s]", records[0].GetRepository(), records[1].GetRepository())
 		}
 	})
+}
+
+func TestPipeline_DelegatesToPhase4ReconcilerWithDCM(t *testing.T) {
+	ctx := context.Background()
+	repoDir := createTestRepoFS(t, sampleSpec, "")
+	mockGH := ghclient.NewMockClient("brotherlogic", "speculate-kv")
+	mockDCM := dcm.NewMockClient()
+	mockStore := pstore.NewMockStore()
+
+	llm := &evaluator.MockLLMClient{
+		Response: `{
+			"id": "Core-1",
+			"stage": "Core",
+			"requirement": "Put stores key",
+			"target_rpc": "Put",
+			"title": "Put stores key",
+			"given": "Empty store",
+			"when": "Put is called",
+			"then": "Value is stored",
+			"test_func_name": "TestPut_Basic"
+		}`,
+	}
+
+	pipeline := NewPipeline(
+		"test-token",
+		func(token, owner, repo string) ghclient.Client { return mockGH },
+		evaluator.NewEvaluator(llm),
+		synthesizer.NewSynthesizer(llm),
+		mockStore,
+	).WithDCMClient(mockDCM).
+		WithHarness(dcm.HarnessAntigravity).
+		WithModel("").
+		WithAttemptTimeout(30 * time.Minute).
+		WithNowFn(time.Now).
+		WithCloneFn(func(ctx context.Context, repoURL, targetDir string) error {
+			return copyDir(repoDir, targetDir)
+		})
+
+	if pipeline.Reconciler() == nil {
+		t.Fatal("expected non-nil Reconciler")
+	}
+
+	resp, err := pipeline.Enroll(ctx, "brotherlogic/speculate-kv")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.GetStage() != pb.LifecycleStage_LIFECYCLE_STAGE_EVALUATING {
+		t.Errorf("expected stage EVALUATING when DCM enabled, got %v", resp.GetStage())
+	}
+
+	containers, err := mockDCM.List(ctx)
+	if err != nil || len(containers) != 1 {
+		t.Fatalf("expected 1 active DCM container, got %d (err: %v)", len(containers), err)
+	}
+	if mainReadme, err := mockGH.GetFileContent(ctx, "README.md", "main"); err == nil && strings.Contains(mainReadme.Content, "Spec%20Alignment") {
+		t.Errorf("expected main README not to be updated directly when DCM enabled, got:\n%s", mainReadme.Content)
+	}
 }
 
 func copyDir(src, dst string) error {
